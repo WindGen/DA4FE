@@ -54,7 +54,7 @@ if __name__ == "__main__":
         "--model",
         type=str,
         # required=True,
-        default="TeCh",
+        default="DA4FE",
         help="model name, options: [TeCh, DA4FE]",
     )
 
@@ -86,13 +86,19 @@ if __name__ == "__main__":
     # forecasting task
     parser.add_argument("--seq_len", type=int, default=512, help="input sequence length") # 根据数据自动设置覆盖
     # model define for baselines
-    parser.add_argument("--patch_len", type=int, default=1, help="for cross_channel pacthing")
+    parser.add_argument("--patch_len", type=int, default=4, help="for cross_channel pacthing")
     parser.add_argument("--enc_in", type=int, default=128, help="encoder input size") # 根据数据自动设置覆盖
-    parser.add_argument("--d_model", type=int, default=512, help="dimension of model")  #512
-    parser.add_argument("--n_heads", type=int, default=12, help="num of heads")  # 8
-    parser.add_argument("--t_layer", type=int, default=8, help="num of encoder layers")  #6
-    parser.add_argument("--v_layer", type=int, default=8, help="num of encoder layers")  #6
-    parser.add_argument("--dropout", type=float, default=0., help="dropout")
+    parser.add_argument("--d_model", type=int, default=256, help="dimension of model")  #512
+    parser.add_argument("--n_heads", type=int, default=6, help="num of heads")  # 8
+    parser.add_argument("--t_layer", type=int, default=4, help="num of encoder layers")  #6
+    parser.add_argument("--v_layer", type=int, default=4, help="num of encoder layers")  #6
+    parser.add_argument(
+        "--f_layer",
+        type=int,
+        default=None,
+        help="num of frequency encoder layers for DA4FE; None follows t_layer",
+    )
+    parser.add_argument("--dropout", type=float, default=0.3, help="dropout")
     
     # Augmentation
     parser.add_argument(
@@ -138,7 +144,7 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument("--itr", type=int, default=1, help="experiments times")
-    parser.add_argument("--train_epochs", type=int, default=200, help="train epochs")
+    parser.add_argument("--train_epochs", type=int, default=500, help="train epochs")
     parser.add_argument(
         "--batch_size", type=int, default=16, help="batch size of train input data"
     )
@@ -146,7 +152,7 @@ if __name__ == "__main__":
         "--patience", type=int, default=32, help="early stopping patience"
     )
     parser.add_argument(
-        "--learning_rate", type=float, default=5e-5, help="optimizer learning rate"
+        "--learning_rate", type=float, default=2e-4, help="optimizer learning rate"
     )
     parser.add_argument("--loss", type=str, default="MSE", help="loss function")
     parser.add_argument(
@@ -224,6 +230,9 @@ if __name__ == "__main__":
                 args.augmentations,
                 args.patch_len,
             )
+            if args.model == "DA4FE":
+                effective_f_layer = args.f_layer if args.f_layer is not None else args.t_layer
+                setting += f"_fl_{effective_f_layer}"
             setting += f"_eegnorm_{int(args.eeg_normalize)}"
             setting += f"_eegcls_{args.eeg_num_classes}"
             effective_eeg_adaptive = args.eeg_adaptive_seq_len and args.requested_seq_len > 0

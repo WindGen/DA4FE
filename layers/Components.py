@@ -51,6 +51,33 @@ class Aug_Temporal_Embedding(nn.Module):
         return self.Temporal_Embedding(x_aug)
 
 
+class Aug_Frequency_Embedding(nn.Module):
+    def __init__(self, configs):
+        super().__init__()
+        self.patch_len = configs.patch_len
+        self.freq_seq_len = configs.seq_len // 2 + 1
+        aug_idxs = configs.augmentations.split(",")
+        self.augmentation = nn.ModuleList(
+            [get_augmentation(aug) for aug in aug_idxs]
+        )
+        self.Frequency_Embedding = (
+            CrossChannelPatching(configs)
+            if self.patch_len > 1
+            else nn.Linear(configs.enc_in, configs.d_model)
+        )
+        self.pos_emb = PositionalEmbedding(d_model=self.freq_seq_len)
+
+    def forward(self, x):  # (batch_size, seq_len, enc_in)
+        x = x.transpose(1, 2)  # (batch_size, enc_in, seq_len)
+        aug_idx = random.randint(0, len(self.augmentation) - 1)
+        x_aug = self.augmentation[aug_idx](x)
+        x_freq = torch.abs(torch.fft.rfft(x_aug, dim=-1))
+        x_freq = x_freq + self.pos_emb(x_freq)
+        if self.patch_len == 1:
+            x_freq = x_freq.transpose(1, 2)
+        return self.Frequency_Embedding(x_freq)
+
+
 class PositionalEmbedding(nn.Module):
     def __init__(self, d_model, max_len=5000):
         super().__init__()
