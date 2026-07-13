@@ -61,7 +61,7 @@ if __name__ == "__main__":
     # data loader
     parser.add_argument(
         "--data", type=str, #required=True, 
-        default="EEG-ImageNet-HF", help="dataset type, e.g. EEG-ImageNet or EEG-ImageNet-HF"
+        default="EEG-ImageNet", help="dataset type, e.g. EEG-ImageNet or EEG-ImageNet-HF"
     )
     parser.add_argument(
         "--root_path",
@@ -92,18 +92,43 @@ if __name__ == "__main__":
     parser.add_argument("--n_heads", type=int, default=6, help="num of heads")  # 8
     parser.add_argument("--t_layer", type=int, default=4, help="num of encoder layers")  #6
     parser.add_argument("--v_layer", type=int, default=4, help="num of encoder layers")  #6
-    parser.add_argument("--f_layer", type=int, default=4,help="num of frequency encoder layers for DA4FE; None follows t_layer",)
-    parser.add_argument("--da4fe_channel_dim",type=int,default=None,help="channel-branch embedding/encoder dim for DA4FE; None follows d_model",)
-    parser.add_argument("--da4fe_temporal_dim",type=int,default=None,help="temporal-branch embedding/encoder dim for DA4FE; None follows d_model",)
-    parser.add_argument("--da4fe_frequency_dim",type=int,default=None,help="frequency-branch embedding/encoder dim for DA4FE; None follows d_model",)
-    parser.add_argument("--da4fe_fusion_mode",type=str,default="add",choices=["add", "concat_mlp"],help="feature fusion mode for DA4FE branches",)
-    parser.add_argument("--da4fe_fusion_hidden_dim",type=int,default=None,help="hidden dim of DA4FE fusion MLP; None follows d_model",)
-    parser.add_argument("--da4fe_fusion_out_dim",type=int,default=None,help="output dim of DA4FE branch fusion; None follows d_model",)
-    
-    parser.add_argument( "--da4fe_channel_weight",type=float,default=1,help="channel-branch weight used by DA4FE when fusion mode is add",)
-    parser.add_argument("--da4fe_temporal_weight",type=float,default=1,help="temporal-branch weight used by DA4FE when fusion mode is add",)
-    parser.add_argument("--da4fe_frequency_weight",type=float,default=1,help="frequency-branch weight used by DA4FE when fusion mode is add",)
-    
+    parser.add_argument(
+        "--f_layer",
+        type=int,
+        default=None,
+        help="num of frequency encoder layers for DA4FE; None follows t_layer",
+    )
+    parser.add_argument(
+        "--da4fe_fusion_mode",
+        type=str,
+        default="add",
+        choices=["add", "concat_mlp"],
+        help="feature fusion mode for DA4FE branches",
+    )
+    parser.add_argument(
+        "--da4fe_fusion_hidden_dim",
+        type=int,
+        default=None,
+        help="hidden dim of DA4FE fusion MLP; None follows d_model",
+    )
+    parser.add_argument(
+        "--da4fe_channel_weight",
+        type=float,
+        default=0.3,
+        help="channel-branch weight used by DA4FE when fusion mode is add",
+    )
+    parser.add_argument(
+        "--da4fe_temporal_weight",
+        type=float,
+        default=0.6,
+        help="temporal-branch weight used by DA4FE when fusion mode is add",
+    )
+    parser.add_argument(
+        "--da4fe_frequency_weight",
+        type=float,
+        default=0.1,
+        help="frequency-branch weight used by DA4FE when fusion mode is add",
+    )
     parser.add_argument("--dropout", type=float, default=0.3, help="dropout")
     
     # Augmentation
@@ -124,7 +149,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--eeg_num_classes",
         type=int,
-        default=0,
+        default=10,
         help="number of EEG-ImageNet classes to use; 0 means all classes",
     )
     parser.add_argument(
@@ -150,7 +175,7 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument("--itr", type=int, default=1, help="experiments times")
-    parser.add_argument("--train_epochs", type=int, default=300, help="train epochs")
+    parser.add_argument("--train_epochs", type=int, default=500, help="train epochs")
     parser.add_argument(
         "--batch_size", type=int, default=16, help="batch size of train input data"
     )
@@ -158,7 +183,7 @@ if __name__ == "__main__":
         "--patience", type=int, default=32, help="early stopping patience"
     )
     parser.add_argument(
-        "--learning_rate", type=float, default=3e-4, help="optimizer learning rate"
+        "--learning_rate", type=float, default=2e-4, help="optimizer learning rate"
     )
     parser.add_argument("--loss", type=str, default="MSE", help="loss function")
     parser.add_argument(
@@ -238,26 +263,8 @@ if __name__ == "__main__":
             )
             if args.model == "DA4FE":
                 effective_f_layer = args.f_layer if args.f_layer is not None else args.t_layer
-                effective_channel_dim = (
-                    args.da4fe_channel_dim if args.da4fe_channel_dim is not None else args.d_model
-                )
-                effective_temporal_dim = (
-                    args.da4fe_temporal_dim if args.da4fe_temporal_dim is not None else args.d_model
-                )
-                effective_frequency_dim = (
-                    args.da4fe_frequency_dim if args.da4fe_frequency_dim is not None else args.d_model
-                )
-                effective_fusion_out_dim = (
-                    args.da4fe_fusion_out_dim if args.da4fe_fusion_out_dim is not None else args.d_model
-                )
                 setting += f"_fl_{effective_f_layer}"
                 setting += f"_fus_{args.da4fe_fusion_mode}"
-                setting += (
-                    f"_cd_{effective_channel_dim}"
-                    f"_td_{effective_temporal_dim}"
-                    f"_fd_{effective_frequency_dim}"
-                    f"_fod_{effective_fusion_out_dim}"
-                )
                 if args.da4fe_fusion_mode == "add":
                     setting += (
                         f"_cw_{args.da4fe_channel_weight}"

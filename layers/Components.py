@@ -71,11 +71,104 @@ class Aug_Frequency_Embedding(nn.Module):
         x = x.transpose(1, 2)  # (batch_size, enc_in, seq_len)
         aug_idx = random.randint(0, len(self.augmentation) - 1)
         x_aug = self.augmentation[aug_idx](x)
-        x_freq = torch.abs(torch.fft.rfft(x_aug, dim=-1))
+        
+        x_fft = torch.fft.rfft(x_aug, dim=-1)
+        # x_freq = torch.log1p(torch.abs(x_fft).pow(2))
+        x_freq = torch.abs(x_fft)
+
         x_freq = x_freq + self.pos_emb(x_freq)
         if self.patch_len == 1:
             x_freq = x_freq.transpose(1, 2)
         return self.Frequency_Embedding(x_freq)
+
+
+class BranchFusion(nn.Module):
+    def __init__(
+        self,
+        num_branches,
+        branch_dims,
+        mode="add",
+        hidden_dim=None,
+        output_dim=None,
+        dropout=0.0,
+        branch_weights=None,
+        normalize_add_weights=True,
+    ):
+        super().__init__()
+        if num_branches <= 0:
+            raise ValueError("num_branches must be positive")
+        if len(branch_dims) != num_branches:
+            raise ValueError(
+                f"Expected {num_branches} branch dims, got {len(branch_dims)}"
+            )
+
+        self.num_branches = num_branches
+        self.branch_dims = list(branch_dims)
+        self.mode = mode
+        if output_dim is None:
+            output_dim = self.branch_dims[0]
+        self.output_dim = output_dim
+        self.hidden_dim = hidden_dim if hidden_dim is not None else self.output_dim
+
+        if mode == "add":
+            self.fusion = None
+            self.projections = nn.ModuleList(
+                [
+                    nn.Identity()
+                    if branch_dim == self.output_dim
+                    else nn.Linear(branch_dim, self.output_dim)
+                    for branch_dim in self.branch_dims
+                ]
+            )
+            if branch_weights is None:
+                branch_weights = [1.0] * num_branches
+            if len(branch_weights) != num_branches:
+                raise ValueError(
+                    f"Expected {num_branches} branch weights, got {len(branch_weights)}"
+                )
+            weights = torch.tensor(branch_weights, dtype=torch.float32)
+            if torch.any(weights < 0):
+                raise ValueError("branch_weights must be non-negative")
+            if normalize_add_weights:
+                weight_sum = torch.sum(weights)
+                if weight_sum <= 0:
+                    raise ValueError("branch_weights must sum to a positive value")
+                weights = weights / weight_sum
+            self.register_buffer("branch_weights", weights)
+        elif mode == "concat_mlp":
+            self.projections = None
+            self.fusion = nn.Sequential(
+                nn.Linear(sum(self.branch_dims), self.hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(self.hidden_dim, self.output_dim),
+                nn.Dropout(dropout),
+            )
+            self.branch_weights = None
+        else:
+            raise ValueError(f"Unsupported fusion mode: {mode}")
+
+    def forward(self, features):
+        if not features:
+            raise ValueError("features must contain at least one tensor")
+        if len(features) == 1:
+            return features[0]
+        if len(features) != self.num_branches:
+            raise ValueError(
+                f"Expected {self.num_branches} features, got {len(features)}"
+            )
+
+        if self.mode == "add":
+            projected = [
+                projection(feature)
+                for projection, feature in zip(self.projections, features)
+            ]
+            stacked = torch.stack(projected, dim=0)
+            weight_shape = [self.num_branches] + [1] * (stacked.dim() - 1)
+            weights = self.branch_weights.view(*weight_shape)
+            return torch.sum(stacked * weights, dim=0)
+
+        return self.fusion(torch.cat(features, dim=-1))
 
 
 class PositionalEmbedding(nn.Module):
