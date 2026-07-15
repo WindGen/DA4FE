@@ -1,10 +1,11 @@
 import argparse
 import os
+from datetime import datetime
+from pathlib import Path
 import torch
 from exp.exp_classification import Exp_Classification
 import random
 import numpy as np
-import os
 import psutil
 
 
@@ -26,6 +27,83 @@ def str_or_none(value):
     if text.lower() in {"none", "null", ""}:
         return None
     return text
+
+
+def build_full_setting(args):
+    setting = "{}_{}_seed_{}_dm_{}_dp_{}_tl_{}_vl_{}_bs_{}_lr{}_aug_{}_pl_{}".format(
+        args.model,
+        args.data,
+        args.seed,
+        args.d_model,
+        args.dropout,
+        args.t_layer,
+        args.v_layer,
+        args.batch_size,
+        args.learning_rate,
+        args.augmentations,
+        args.patch_len,
+    )
+    if args.model == "DA4FE":
+        effective_f_layer = args.f_layer if args.f_layer is not None else args.t_layer
+        effective_channel_dim = (
+            args.da4fe_channel_dim if args.da4fe_channel_dim is not None else args.d_model
+        )
+        effective_temporal_dim = (
+            args.da4fe_temporal_dim if args.da4fe_temporal_dim is not None else args.d_model
+        )
+        effective_frequency_dim = (
+            args.da4fe_frequency_dim if args.da4fe_frequency_dim is not None else args.d_model
+        )
+        effective_fusion_out_dim = (
+            args.da4fe_fusion_out_dim if args.da4fe_fusion_out_dim is not None else args.d_model
+        )
+        setting += f"_fl_{effective_f_layer}"
+        setting += f"_fus_{args.da4fe_fusion_mode}"
+        setting += (
+            f"_cd_{effective_channel_dim}"
+            f"_td_{effective_temporal_dim}"
+            f"_fd_{effective_frequency_dim}"
+            f"_fod_{effective_fusion_out_dim}"
+        )
+        if args.da4fe_fusion_mode == "add":
+            setting += (
+                f"_cw_{args.da4fe_channel_weight}"
+                f"_tw_{args.da4fe_temporal_weight}"
+                f"_fw_{args.da4fe_frequency_weight}"
+            )
+        if (
+            args.da4fe_fusion_mode == "concat_mlp"
+            and args.da4fe_fusion_hidden_dim is not None
+        ):
+            setting += f"_fhd_{args.da4fe_fusion_hidden_dim}"
+
+    setting += f"_loss_{args.loss}"
+    if args.loss == "ce_triplet":
+        setting += f"_tm_{args.triplet_margin}"
+        setting += f"_tw_{args.triplet_weight}"
+
+    setting += f"_eegnorm_{int(args.eeg_normalize)}"
+    setting += f"_eegcls_{args.eeg_num_classes}"
+    effective_eeg_adaptive = args.eeg_adaptive_seq_len and args.requested_seq_len > 0
+    setting += f"_eegadapt_{int(effective_eeg_adaptive)}"
+    if effective_eeg_adaptive:
+        setting += f"_sl_{args.requested_seq_len}"
+
+    return setting
+
+
+def build_run_directory_name(args):
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    candidate = timestamp
+    roots = [Path("./checkpoints") / args.model]
+    if args.log_dir is not None:
+        roots.append(Path(args.log_dir) / args.data)
+
+    suffix = 1
+    while any((root / candidate).exists() for root in roots):
+        candidate = f"{timestamp}_{suffix:02d}"
+        suffix += 1
+    return candidate
 
 
 def use_cpus(gpus: list, cpus_per_gpu: int):
@@ -66,7 +144,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--root_path",
         type=str,
-        default="/root/autodl-tmp/TeCh-improve/EEG-ImageNet",
+        default=None,
         help="root path of the local data files; ignored by EEG-ImageNet-HF unless used manually as a cache location",
     )
     parser.add_argument("--data_path", type=str, default="EEG-ImageNet", help="data file")
@@ -89,16 +167,16 @@ if __name__ == "__main__":
     parser.add_argument("--patch_len", type=int, default=4, help="for cross_channel pacthing")
     parser.add_argument("--enc_in", type=int, default=128, help="encoder input size") # 根据数据自动设置覆盖
     parser.add_argument("--d_model", type=int, default=256, help="dimension of model")  #512
-    parser.add_argument("--n_heads", type=int, default=6, help="num of heads")  # 8
-    parser.add_argument("--t_layer", type=int, default=4, help="num of encoder layers")  #6
-    parser.add_argument("--v_layer", type=int, default=4, help="num of encoder layers")  #6
-    parser.add_argument("--f_layer", type=int, default=4,help="num of frequency encoder layers for DA4FE; None follows t_layer",)
-    parser.add_argument("--da4fe_channel_dim",type=int,default=None,help="channel-branch embedding/encoder dim for DA4FE; None follows d_model",)
-    parser.add_argument("--da4fe_temporal_dim",type=int,default=None,help="temporal-branch embedding/encoder dim for DA4FE; None follows d_model",)
-    parser.add_argument("--da4fe_frequency_dim",type=int,default=None,help="frequency-branch embedding/encoder dim for DA4FE; None follows d_model",)
-    parser.add_argument("--da4fe_fusion_mode",type=str,default="add",choices=["add", "concat_mlp"],help="feature fusion mode for DA4FE branches",)
-    parser.add_argument("--da4fe_fusion_hidden_dim",type=int,default=None,help="hidden dim of DA4FE fusion MLP; None follows d_model",)
-    parser.add_argument("--da4fe_fusion_out_dim",type=int,default=None,help="output dim of DA4FE branch fusion; None follows d_model",)
+    parser.add_argument("--n_heads", type=int, default=4, help="num of heads")  # 8
+    parser.add_argument("--t_layer", type=int, default=2, help="num of encoder layers")  #6
+    parser.add_argument("--v_layer", type=int, default=2, help="num of encoder layers")  #6
+    parser.add_argument("--f_layer", type=int, default=2,help="num of frequency encoder layers for DA4FE; None follows t_layer",)
+    parser.add_argument("--da4fe_channel_dim",type=int,default=128,help="channel-branch embedding/encoder dim for DA4FE; None follows d_model",)
+    parser.add_argument("--da4fe_temporal_dim",type=int,default=128,help="temporal-branch embedding/encoder dim for DA4FE; None follows d_model",)
+    parser.add_argument("--da4fe_frequency_dim",type=int,default=128,help="frequency-branch embedding/encoder dim for DA4FE; None follows d_model",)
+    parser.add_argument("--da4fe_fusion_mode",type=str,default="concat_mlp",choices=["add", "concat_mlp"],help="feature fusion mode for DA4FE branches",)
+    parser.add_argument("--da4fe_fusion_hidden_dim",type=int,default=256,help="hidden dim of DA4FE fusion MLP; None follows d_model",)
+    parser.add_argument("--da4fe_fusion_out_dim",type=int,default=256,help="output dim of DA4FE branch fusion; None follows d_model",)
     
     parser.add_argument( "--da4fe_channel_weight",type=float,default=1,help="channel-branch weight used by DA4FE when fusion mode is add",)
     parser.add_argument("--da4fe_temporal_weight",type=float,default=1,help="temporal-branch weight used by DA4FE when fusion mode is add",)
@@ -149,21 +227,24 @@ if __name__ == "__main__":
             "inside the corresponding checkpoints/<model>/<setting> folder"
         ),
     )
+
     parser.add_argument("--itr", type=int, default=1, help="experiments times")
-    parser.add_argument("--train_epochs", type=int, default=300, help="train epochs")
+    parser.add_argument("--train_epochs", type=int, default=500, help="train epochs")
     parser.add_argument(
         "--batch_size", type=int, default=16, help="batch size of train input data"
     )
     parser.add_argument(
-        "--patience", type=int, default=32, help="early stopping patience"
+        "--patience", type=int, default=16, help="early stopping patience"
     )
     parser.add_argument(
-        "--learning_rate", type=float, default=3e-4, help="optimizer learning rate"
+        "--learning_rate", type=float, default=1e-4, help="optimizer learning rate"
     )
+
+
     parser.add_argument(
         "--loss",
         type=str,
-        default="ce",
+        default="ce_triplet",
         choices=["ce", "ce_triplet"],
         help="training objective: ce or ce_triplet",
     )
@@ -179,6 +260,8 @@ if __name__ == "__main__":
         default=0.2,
         help="weight of triplet loss in the total objective when --loss ce_triplet",
     )
+
+
     parser.add_argument(
         "--lradj", type=str, default="cosine", help="adjust learning rate"
     )
@@ -241,69 +324,16 @@ if __name__ == "__main__":
 
             # setting record of experiments
             args.seed = seed
-            setting = "{}_{}_seed_{}_dm_{}_dp_{}_tl_{}_vl_{}_bs_{}_lr{}_aug_{}_pl_{}".format(
-                args.model,
-                args.data,
-                args.seed,
-                args.d_model,
-                args.dropout,
-                args.t_layer,
-                args.v_layer,
-                args.batch_size,
-                args.learning_rate,
-                args.augmentations,
-                args.patch_len,
-            )
-            if args.model == "DA4FE":
-                effective_f_layer = args.f_layer if args.f_layer is not None else args.t_layer
-                effective_channel_dim = (
-                    args.da4fe_channel_dim if args.da4fe_channel_dim is not None else args.d_model
-                )
-                effective_temporal_dim = (
-                    args.da4fe_temporal_dim if args.da4fe_temporal_dim is not None else args.d_model
-                )
-                effective_frequency_dim = (
-                    args.da4fe_frequency_dim if args.da4fe_frequency_dim is not None else args.d_model
-                )
-                effective_fusion_out_dim = (
-                    args.da4fe_fusion_out_dim if args.da4fe_fusion_out_dim is not None else args.d_model
-                )
-                setting += f"_fl_{effective_f_layer}"
-                setting += f"_fus_{args.da4fe_fusion_mode}"
-                setting += (
-                    f"_cd_{effective_channel_dim}"
-                    f"_td_{effective_temporal_dim}"
-                    f"_fd_{effective_frequency_dim}"
-                    f"_fod_{effective_fusion_out_dim}"
-                )
-                if args.da4fe_fusion_mode == "add":
-                    setting += (
-                        f"_cw_{args.da4fe_channel_weight}"
-                        f"_tw_{args.da4fe_temporal_weight}"
-                        f"_fw_{args.da4fe_frequency_weight}"
-                    )
-                if (
-                    args.da4fe_fusion_mode == "concat_mlp"
-                    and args.da4fe_fusion_hidden_dim is not None
-                ):
-                    setting += f"_fhd_{args.da4fe_fusion_hidden_dim}"
-            setting += f"_loss_{args.loss}"
-            if args.loss == "ce_triplet":
-                setting += (
-                    f"_tm_{args.triplet_margin}"
-                    f"_tw_{args.triplet_weight}"
-                )
-            setting += f"_eegnorm_{int(args.eeg_normalize)}"
-            setting += f"_eegcls_{args.eeg_num_classes}"
-            effective_eeg_adaptive = args.eeg_adaptive_seq_len and args.requested_seq_len > 0
-            setting += f"_eegadapt_{int(effective_eeg_adaptive)}"
-            if effective_eeg_adaptive:
-                setting += f"_sl_{args.requested_seq_len}"
+            args.full_setting_name = build_full_setting(args)
+            args.run_started_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            setting = build_run_directory_name(args)
+            args.run_directory_name = setting
 
             exp = Exp(args)  # set experiments
             print(
                 ">>>>>>>start training : {}>>>>>>>>>>>>>>>>>>>>>>>>>>".format(setting)
             )
+            print("Full setting:", args.full_setting_name)
             exp.train(setting)
 
             print(

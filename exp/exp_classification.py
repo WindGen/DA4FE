@@ -81,6 +81,7 @@ class Exp_Classification(Exp_Basic):
         super().__init__(args)
         self.metrics_log_path = None
         self.split_summary_path = None
+        self.run_params_path = None
         self.triplet_criterion = None
 
     def _dataset_seq_len(self, dataset):
@@ -135,18 +136,43 @@ class Exp_Classification(Exp_Basic):
         return Path(log_root) / self.args.data / setting
 
     def _prepare_metric_logging(self, setting, train_data, vali_data, test_data):
+        checkpoint_dir = self._checkpoint_dir(setting)
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
         log_dir = self._log_dir(setting)
         log_dir.mkdir(parents=True, exist_ok=True)
 
         self.metrics_log_path = log_dir / "metrics.csv"
         self.split_summary_path = log_dir / "split_summary.json"
+        self.run_params_path = checkpoint_dir / "run_params.json"
 
         with self.metrics_log_path.open("w", newline="", encoding="utf-8") as file_obj:
             writer = csv.DictWriter(file_obj, fieldnames=self.METRIC_FIELDNAMES)
             writer.writeheader()
 
+        run_params_payload = {
+            "run_directory_name": setting,
+            "full_setting_name": getattr(self.args, "full_setting_name", setting),
+            "run_started_at": getattr(self.args, "run_started_at", None),
+            "paths": {
+                "checkpoint_dir": str(checkpoint_dir),
+                "log_dir": str(log_dir),
+            },
+            "args": vars(deepcopy(self.args)),
+        }
+        self.run_params_path.write_text(
+            json.dumps(run_params_payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        if log_dir != checkpoint_dir:
+            (log_dir / "run_params.json").write_text(
+                json.dumps(run_params_payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+
         summary_payload = {
             "setting": setting,
+            "full_setting_name": getattr(self.args, "full_setting_name", setting),
             "args": vars(deepcopy(self.args)),
             "splits": {
                 "train": self._dataset_summary_payload(train_data, "TRAIN"),
