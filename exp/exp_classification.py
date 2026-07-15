@@ -13,6 +13,7 @@ import random
 import csv
 import json
 from pathlib import Path
+import torch.nn.functional as F
 from sklearn.metrics import accuracy_score
 from sklearn.metrics import precision_score
 from sklearn.metrics import recall_score
@@ -21,6 +22,42 @@ from sklearn.metrics import roc_auc_score
 from sklearn.metrics import average_precision_score
 
 warnings.filterwarnings("ignore")
+
+
+class BatchHardTripletLoss(nn.Module):
+    def __init__(self, margin=0.2):
+        super().__init__()
+        self.margin = margin
+
+    def forward(self, features, labels):
+        if features.ndim != 2:
+            raise ValueError("Triplet features must be a 2D tensor")
+
+        labels = labels.reshape(-1)
+        batch_size = labels.size(0)
+        if batch_size < 2:
+            return features.new_zeros(())
+
+        distances = torch.cdist(features, features, p=2)
+        same_label = labels.unsqueeze(0).eq(labels.unsqueeze(1))
+        diag_mask = torch.eye(batch_size, device=labels.device, dtype=torch.bool)
+        positive_mask = same_label & ~diag_mask
+        negative_mask = ~same_label
+
+        valid = positive_mask.any(dim=1) & negative_mask.any(dim=1)
+        if not valid.any():
+            return features.new_zeros(())
+
+        hardest_positive = distances.masked_fill(
+            ~positive_mask, float("-inf")
+        ).max(dim=1).values
+        hardest_negative = distances.masked_fill(
+            ~negative_mask, float("inf")
+        ).min(dim=1).values
+        losses = F.relu(
+            hardest_positive[valid] - hardest_negative[valid] + self.margin
+        )
+        return losses.mean()
 
 
 class Exp_Classification(Exp_Basic):
@@ -44,6 +81,7 @@ class Exp_Classification(Exp_Basic):
         super().__init__(args)
         self.metrics_log_path = None
         self.split_summary_path = None
+        self.triplet_criterion = None
 
     def _dataset_seq_len(self, dataset):
         if hasattr(dataset, "max_seq_len"):
@@ -156,11 +194,11 @@ class Exp_Classification(Exp_Basic):
             writer.writerow(row)
 
     def _compute_metrics(self, preds, trues):
-        probs = torch.nn.functional.softmax(
+        probs = F.softmax(
             preds, dim=1
         )  # (total_samples, num_classes) est. prob. for each class and sample
         trues_onehot = (
-            torch.nn.functional.one_hot(
+            F.one_hot(
                 trues.reshape(
                     -1,
                 ).to(torch.long),
@@ -199,6 +237,27 @@ class Exp_Classification(Exp_Basic):
             "AUPRC": auprc,
         }
 
+    def _use_triplet_loss(self):
+        return self.args.loss == "ce_triplet"
+
+    def _forward_model(self, batch_x):
+        if self._use_triplet_loss():
+            return self.model(batch_x, return_features=True)
+        return self.model(batch_x)
+
+    def _compute_objective(self, model_outputs, labels, ce_criterion):
+        if self._use_triplet_loss():
+            logits, features = model_outputs
+            ce_loss = ce_criterion(logits, labels.long())
+            normalized_features = F.normalize(features, p=2, dim=1)
+            triplet_loss = self.triplet_criterion(normalized_features, labels.long())
+            total_loss = ce_loss + self.args.triplet_weight * triplet_loss
+            return total_loss, logits
+
+        logits = model_outputs
+        total_loss = ce_criterion(logits, labels.long())
+        return total_loss, logits
+
     def _evaluate_loader(self, data_loader, criterion):
         total_loss = []
         preds = []
@@ -211,10 +270,11 @@ class Exp_Classification(Exp_Basic):
                 padding_mask = padding_mask.float().to(self.device)
                 label = label.to(self.device)
 
-                outputs = self.model(batch_x)
-
-                pred = outputs.detach().cpu()
-                loss = criterion(pred, label.long().cpu())
+                model_outputs = self._forward_model(batch_x)
+                loss, logits = self._compute_objective(
+                    model_outputs, label, criterion
+                )
+                pred = logits.detach().cpu()
                 total_loss.append(loss.item())
 
                 preds.append(pred)
@@ -252,8 +312,15 @@ class Exp_Classification(Exp_Basic):
         return model_optim
 
     def _select_criterion(self):
-        criterion = nn.CrossEntropyLoss()
-        return criterion
+        self.triplet_criterion = None
+        if self.args.loss == "ce":
+            return nn.CrossEntropyLoss()
+        if self.args.loss == "ce_triplet":
+            self.triplet_criterion = BatchHardTripletLoss(
+                margin=self.args.triplet_margin
+            )
+            return nn.CrossEntropyLoss()
+        raise ValueError(f"Unsupported loss type: {self.args.loss}")
 
     def vali(self, vali_data, vali_loader, criterion):
         return self._evaluate_loader(vali_loader, criterion)
@@ -296,8 +363,10 @@ class Exp_Classification(Exp_Basic):
                 padding_mask = padding_mask.float().to(self.device)
                 label = label.to(self.device)
 
-                outputs = self.model(batch_x)
-                loss = criterion(outputs, label.long())
+                model_outputs = self._forward_model(batch_x)
+                loss, logits = self._compute_objective(
+                    model_outputs, label, criterion
+                )
                 train_loss.append(loss.item())
 
                 loss.backward()

@@ -160,7 +160,25 @@ if __name__ == "__main__":
     parser.add_argument(
         "--learning_rate", type=float, default=3e-4, help="optimizer learning rate"
     )
-    parser.add_argument("--loss", type=str, default="MSE", help="loss function")
+    parser.add_argument(
+        "--loss",
+        type=str,
+        default="ce",
+        choices=["ce", "ce_triplet"],
+        help="training objective: ce or ce_triplet",
+    )
+    parser.add_argument(
+        "--triplet_margin",
+        type=float,
+        default=0.2,
+        help="margin used by batch-hard triplet loss when --loss ce_triplet",
+    )
+    parser.add_argument(
+        "--triplet_weight",
+        type=float,
+        default=0.2,
+        help="weight of triplet loss in the total objective when --loss ce_triplet",
+    )
     parser.add_argument(
         "--lradj", type=str, default="cosine", help="adjust learning rate"
     )
@@ -269,6 +287,12 @@ if __name__ == "__main__":
                     and args.da4fe_fusion_hidden_dim is not None
                 ):
                     setting += f"_fhd_{args.da4fe_fusion_hidden_dim}"
+            setting += f"_loss_{args.loss}"
+            if args.loss == "ce_triplet":
+                setting += (
+                    f"_tm_{args.triplet_margin}"
+                    f"_tw_{args.triplet_weight}"
+                )
             setting += f"_eegnorm_{int(args.eeg_normalize)}"
             setting += f"_eegcls_{args.eeg_num_classes}"
             effective_eeg_adaptive = args.eeg_adaptive_seq_len and args.requested_seq_len > 0

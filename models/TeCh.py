@@ -25,8 +25,11 @@ class Model(nn.Module):
         )
         self.projector = nn.Linear(configs.d_model, configs.num_class)
 
-    def forward(self, x_enc):
+    def forward(self, x_enc, return_features=False):
         channel = self.channel_encoder(x_enc).mean(1) if self.v_layer > 0 else 0
         temporal = self.temporal_encoder(x_enc).mean(1) if self.t_layer > 0 else 0
-        logits = self.projector(channel + temporal)
+        fused = channel + temporal
+        logits = self.projector(fused)
+        if return_features:
+            return logits, fused
         return logits

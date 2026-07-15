@@ -73,8 +73,7 @@ class Aug_Frequency_Embedding(nn.Module):
         x_aug = self.augmentation[aug_idx](x)
         
         x_fft = torch.fft.rfft(x_aug, dim=-1)
-        # x_freq = torch.log1p(torch.abs(x_fft).pow(2))
-        x_freq = torch.abs(x_fft)
+        x_freq = torch.log1p(torch.abs(x_fft).pow(2))
 
         x_freq = x_freq + self.pos_emb(x_freq)
         if self.patch_len == 1:
@@ -137,6 +136,9 @@ class BranchFusion(nn.Module):
             self.register_buffer("branch_weights", weights)
         elif mode == "concat_mlp":
             self.projections = None
+            self.branch_norms = nn.ModuleList(
+                [nn.LayerNorm(branch_dim) for branch_dim in self.branch_dims]
+            )
             self.fusion = nn.Sequential(
                 nn.Linear(sum(self.branch_dims), self.hidden_dim),
                 nn.GELU(),
@@ -168,7 +170,10 @@ class BranchFusion(nn.Module):
             weights = self.branch_weights.view(*weight_shape)
             return torch.sum(stacked * weights, dim=0)
 
-        return self.fusion(torch.cat(features, dim=-1))
+        normalized = [
+            norm(feature) for norm, feature in zip(self.branch_norms, features)
+        ]
+        return self.fusion(torch.cat(normalized, dim=-1))
 
 
 class PositionalEmbedding(nn.Module):

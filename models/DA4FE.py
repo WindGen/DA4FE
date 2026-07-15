@@ -107,7 +107,7 @@ class Model(nn.Module):
         )
         self.projector = nn.Linear(self.fusion_output_dim, configs.num_class)
 
-    def forward(self, x_enc):
+    def forward(self, x_enc, return_features=False):
         features = []
         if self.v_layer > 0:
             features.append(self.channel_encoder(x_enc).mean(1))
@@ -118,4 +118,6 @@ class Model(nn.Module):
 
         fused = self.fusion(features)
         logits = self.projector(fused)
+        if return_features:
+            return logits, fused
         return logits
