@@ -342,7 +342,27 @@ if __name__ == "__main__":
             avg_metrics.append(exp.test(setting))
             torch.cuda.empty_cache()
             
-    means=[np.mean([avg_metrics[i][j] for i in range(args.itr)]) for j in ('Accuracy', 'Precision', 'Recall', 'F1', 'AUROC','AUPRC')]
-    stds=[np.std([avg_metrics[i][j] for i in range(args.itr)]) for j in ('Accuracy', 'Precision', 'Recall', 'F1', 'AUROC','AUPRC')]
-    print(f'Mean accuracy: {means[0]:.4f}, precision: {means[1]:.4f},recall: {means[2]:.4f}, f1: {means[3]:.4f}, AUROC: {means[4]:.4f}, AUPRC: {means[5]:.4f}')
-    print(f'Std accuracy: {stds[0]:.4f}, precision: {stds[1]:.4f},recall: {stds[2]:.4f}, f1: {stds[3]:.4f}, AUROC: {stds[4]:.4f}, AUPRC: {stds[5]:.4f}')
+    summary_keys = (
+        "Accuracy",
+        "Top1Accuracy",
+        "Top3Accuracy",
+        "Top5Accuracy",
+        "Top10Accuracy",
+        "Precision",
+        "Recall",
+        "F1",
+        "AUROC",
+        "AUPRC",
+    )
+    means = [np.mean([avg_metrics[i][j] for i in range(args.itr)]) for j in summary_keys]
+    stds = [np.std([avg_metrics[i][j] for i in range(args.itr)]) for j in summary_keys]
+    print(
+        f"Mean accuracy: {means[0]:.4f}, top1: {means[1]:.4f}, top3: {means[2]:.4f}, "
+        f"top5: {means[3]:.4f}, top10: {means[4]:.4f}, precision: {means[5]:.4f}, "
+        f"recall: {means[6]:.4f}, f1: {means[7]:.4f}, AUROC: {means[8]:.4f}, AUPRC: {means[9]:.4f}"
+    )
+    print(
+        f"Std accuracy: {stds[0]:.4f}, top1: {stds[1]:.4f}, top3: {stds[2]:.4f}, "
+        f"top5: {stds[3]:.4f}, top10: {stds[4]:.4f}, precision: {stds[5]:.4f}, "
+        f"recall: {stds[6]:.4f}, f1: {stds[7]:.4f}, AUROC: {stds[8]:.4f}, AUPRC: {stds[9]:.4f}"
+    )

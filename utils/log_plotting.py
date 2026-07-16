@@ -22,12 +22,20 @@ METRIC_ALIASES = {
     "eval_loss": "loss",
     "train_step_loss": "opt_loss",
     "step_loss": "opt_loss",
+    "top1": "top1_accuracy",
+    "top3": "top3_accuracy",
+    "top5": "top5_accuracy",
+    "top10": "top10_accuracy",
 }
 
 METRIC_LABELS = {
     "loss": "Evaluation Loss",
     "opt_loss": "Train Step Loss",
     "accuracy": "Accuracy",
+    "top1_accuracy": "Top-1 Accuracy",
+    "top3_accuracy": "Top-3 Accuracy",
+    "top5_accuracy": "Top-5 Accuracy",
+    "top10_accuracy": "Top-10 Accuracy",
     "precision": "Precision",
     "recall": "Recall",
     "f1": "Macro F1",
@@ -102,6 +110,10 @@ def _empty_metric_frame() -> pd.DataFrame:
             "loss",
             "opt_loss",
             "accuracy",
+            "top1_accuracy",
+            "top3_accuracy",
+            "top5_accuracy",
+            "top10_accuracy",
             "precision",
             "recall",
             "f1",
@@ -154,13 +166,17 @@ def load_training_log(log_path: str | Path) -> pd.DataFrame:
 
 def _parse_plain_text_log(log_path: Path) -> pd.DataFrame:
     metric_pattern = re.compile(
-        r"Loss:\s*([-+0-9.eE]+),\s*"
-        r"Accuracy:\s*([-+0-9.eE]+),\s*"
-        r"Precision:\s*([-+0-9.eE]+),\s*"
-        r"Recall:\s*([-+0-9.eE]+)\s*,?\s*"
-        r"F1:\s*([-+0-9.eE]+),\s*"
-        r"AUROC:\s*([-+0-9.eE]+),\s*"
-        r"AUPRC:\s*([-+0-9.eE]+)"
+        r"Loss:\s*(?P<loss>[-+0-9.eE]+),\s*"
+        r"Accuracy:\s*(?P<accuracy>[-+0-9.eE]+),\s*"
+        r"(?:Top1:\s*(?P<top1>[-+0-9.eE]+),\s*)?"
+        r"(?:Top3:\s*(?P<top3>[-+0-9.eE]+),\s*)?"
+        r"(?:Top5:\s*(?P<top5>[-+0-9.eE]+),\s*)?"
+        r"(?:Top10:\s*(?P<top10>[-+0-9.eE]+),\s*)?"
+        r"Precision:\s*(?P<precision>[-+0-9.eE]+),\s*"
+        r"Recall:\s*(?P<recall>[-+0-9.eE]+)\s*,?\s*"
+        r"F1:\s*(?P<f1>[-+0-9.eE]+),\s*"
+        r"AUROC:\s*(?P<auroc>[-+0-9.eE]+),\s*"
+        r"AUPRC:\s*(?P<auprc>[-+0-9.eE]+)"
     )
     epoch_time_pattern = re.compile(r"Epoch:\s*(\d+)\s+cost time:\s*([-+0-9.eE]+)")
     train_step_pattern = re.compile(
@@ -245,14 +261,18 @@ def _parse_plain_text_log(log_path: Path) -> pd.DataFrame:
                 "epoch": epoch_value,
                 "epoch_num": epoch_num,
                 "split": matched_split,
-                "loss": float(metrics_match.group(1)),
+                "loss": float(metrics_match.group("loss")),
                 "opt_loss": context.get("opt_loss", math.nan) if matched_split == "train" else math.nan,
-                "accuracy": float(metrics_match.group(2)),
-                "precision": float(metrics_match.group(3)),
-                "recall": float(metrics_match.group(4)),
-                "f1": float(metrics_match.group(5)),
-                "auroc": float(metrics_match.group(6)),
-                "auprc": float(metrics_match.group(7)),
+                "accuracy": float(metrics_match.group("accuracy")),
+                "top1_accuracy": float(metrics_match.group("top1") or metrics_match.group("accuracy")),
+                "top3_accuracy": float(metrics_match.group("top3")) if metrics_match.group("top3") is not None else math.nan,
+                "top5_accuracy": float(metrics_match.group("top5")) if metrics_match.group("top5") is not None else math.nan,
+                "top10_accuracy": float(metrics_match.group("top10")) if metrics_match.group("top10") is not None else math.nan,
+                "precision": float(metrics_match.group("precision")),
+                "recall": float(metrics_match.group("recall")),
+                "f1": float(metrics_match.group("f1")),
+                "auroc": float(metrics_match.group("auroc")),
+                "auprc": float(metrics_match.group("auprc")),
                 "learning_rate": math.nan,
                 "epoch_time_sec": context.get("epoch_time_sec", math.nan),
                 "steps": context.get("steps", math.nan),

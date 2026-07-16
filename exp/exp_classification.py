@@ -61,12 +61,17 @@ class BatchHardTripletLoss(nn.Module):
 
 
 class Exp_Classification(Exp_Basic):
+    TOPK_VALUES = (1, 3, 5, 10)
     METRIC_FIELDNAMES = [
         "epoch",
         "split",
         "loss",
         "opt_loss",
         "accuracy",
+        "top1_accuracy",
+        "top3_accuracy",
+        "top5_accuracy",
+        "top10_accuracy",
         "precision",
         "recall",
         "f1",
@@ -205,6 +210,10 @@ class Exp_Classification(Exp_Basic):
             "loss": float(loss),
             "opt_loss": "" if opt_loss is None else float(opt_loss),
             "accuracy": float(metrics_dict["Accuracy"]),
+            "top1_accuracy": float(metrics_dict["Top1Accuracy"]),
+            "top3_accuracy": float(metrics_dict["Top3Accuracy"]),
+            "top5_accuracy": float(metrics_dict["Top5Accuracy"]),
+            "top10_accuracy": float(metrics_dict["Top10Accuracy"]),
             "precision": float(metrics_dict["Precision"]),
             "recall": float(metrics_dict["Recall"]),
             "f1": float(metrics_dict["F1"]),
@@ -219,10 +228,32 @@ class Exp_Classification(Exp_Basic):
             writer = csv.DictWriter(file_obj, fieldnames=self.METRIC_FIELDNAMES)
             writer.writerow(row)
 
+    def _compute_topk_accuracies(self, probs, trues):
+        num_classes = probs.shape[1]
+        max_k = min(max(self.TOPK_VALUES), num_classes)
+        topk_indices = torch.topk(probs, k=max_k, dim=1).indices
+        labels = trues.reshape(-1, 1).to(torch.long)
+        topk_correct = topk_indices.eq(labels)
+
+        topk_metrics = {}
+        for k in self.TOPK_VALUES:
+            effective_k = min(k, num_classes)
+            topk_metrics[f"Top{k}Accuracy"] = (
+                topk_correct[:, :effective_k].any(dim=1).float().mean().item()
+            )
+        return topk_metrics
+
+    def _format_topk_summary(self, metrics_dict):
+        return ", ".join(
+            f"Top{k}: {metrics_dict[f'Top{k}Accuracy']:.5f}"
+            for k in self.TOPK_VALUES
+        )
+
     def _compute_metrics(self, preds, trues):
         probs = F.softmax(
             preds, dim=1
         )  # (total_samples, num_classes) est. prob. for each class and sample
+        topk_metrics = self._compute_topk_accuracies(probs, trues)
         trues_onehot = (
             F.one_hot(
                 trues.reshape(
@@ -252,6 +283,7 @@ class Exp_Classification(Exp_Basic):
 
         return {
             "Accuracy": accuracy_score(trues, predictions),
+            **topk_metrics,
             "Precision": precision_score(
                 trues, predictions, average="macro", zero_division=0
             ),
@@ -432,6 +464,7 @@ class Exp_Classification(Exp_Basic):
                 f"Epoch: {epoch + 1}, Steps: {train_steps}, | Train Step Loss: {train_loss:.5f}\n"
                 f"Train results --- Loss: {train_eval_loss:.5f}, "
                 f"Accuracy: {train_metrics_dict['Accuracy']:.5f}, "
+                f"{self._format_topk_summary(train_metrics_dict)}, "
                 f"Precision: {train_metrics_dict['Precision']:.5f}, "
                 f"Recall: {train_metrics_dict['Recall']:.5f}, "
                 f"F1: {train_metrics_dict['F1']:.5f}, "
@@ -439,6 +472,7 @@ class Exp_Classification(Exp_Basic):
                 f"AUPRC: {train_metrics_dict['AUPRC']:.5f}\n"
                 f"Validation results --- Loss: {vali_loss:.5f}, "
                 f"Accuracy: {val_metrics_dict['Accuracy']:.5f}, "
+                f"{self._format_topk_summary(val_metrics_dict)}, "
                 f"Precision: {val_metrics_dict['Precision']:.5f}, "
                 f"Recall: {val_metrics_dict['Recall']:.5f}, "
                 f"F1: {val_metrics_dict['F1']:.5f}, "
@@ -495,6 +529,7 @@ class Exp_Classification(Exp_Basic):
         print(
             f"Final validation results --- Loss: {vali_loss:.5f}, "
             f"Accuracy: {val_metrics_dict['Accuracy']:.5f}, "
+            f"{self._format_topk_summary(val_metrics_dict)}, "
             f"Precision: {val_metrics_dict['Precision']:.5f}, "
             f"Recall: {val_metrics_dict['Recall']:.5f}, "
             f"F1: {val_metrics_dict['F1']:.5f}, "
@@ -502,6 +537,7 @@ class Exp_Classification(Exp_Basic):
             f"AUPRC: {val_metrics_dict['AUPRC']:.5f}\n"
             f"Final test results --- Loss: {test_loss:.5f}, "
             f"Accuracy: {test_metrics_dict['Accuracy']:.5f}, "
+            f"{self._format_topk_summary(test_metrics_dict)}, "
             f"Precision: {test_metrics_dict['Precision']:.5f}, "
             f"Recall: {test_metrics_dict['Recall']:.5f}, "
             f"F1: {test_metrics_dict['F1']:.5f}, "
