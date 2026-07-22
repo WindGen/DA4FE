@@ -88,6 +88,8 @@ class Exp_Classification(Exp_Basic):
         self.split_summary_path = None
         self.run_params_path = None
         self.triplet_criterion = None
+        self.triplet_enabled = False
+        self.triplet_ready_counter = 0
 
     def _dataset_seq_len(self, dataset):
         if hasattr(dataset, "max_seq_len"):
@@ -298,6 +300,105 @@ class Exp_Classification(Exp_Basic):
     def _use_triplet_loss(self):
         return self.args.loss == "ce_triplet"
 
+    def _use_metric_gated_triplet(self):
+        return self._use_triplet_loss() and getattr(
+            self.args, "triplet_enable_strategy", "always"
+        ) == "metric"
+
+    def _is_triplet_active(self):
+        return self._use_triplet_loss() and self.triplet_enabled
+
+    def _reset_triplet_state(self):
+        self.triplet_ready_counter = 0
+        self.triplet_enabled = self._use_triplet_loss() and not self._use_metric_gated_triplet()
+
+    def _metric_value_by_name(self, metrics_dict, metric_name):
+        metric_map = {
+            "accuracy": "Accuracy",
+            "top1": "Top1Accuracy",
+            "top3": "Top3Accuracy",
+            "top5": "Top5Accuracy",
+            "top10": "Top10Accuracy",
+            "precision": "Precision",
+            "recall": "Recall",
+            "f1": "F1",
+            "auroc": "AUROC",
+            "auprc": "AUPRC",
+        }
+        return float(metrics_dict[metric_map[metric_name]])
+
+    def _maybe_activate_triplet(self, epoch, train_metrics_dict, val_metrics_dict):
+        if not self._use_metric_gated_triplet() or self.triplet_enabled:
+            return
+
+        monitor_split = getattr(self.args, "triplet_monitor_split", "val")
+        monitor_metrics = train_metrics_dict if monitor_split == "train" else val_metrics_dict
+        metric_name = getattr(self.args, "triplet_start_metric", "accuracy")
+        metric_value = self._metric_value_by_name(monitor_metrics, metric_name)
+        threshold = float(getattr(self.args, "triplet_start_value", 0.0))
+        patience = max(1, int(getattr(self.args, "triplet_start_patience", 1)))
+
+        if metric_value >= threshold:
+            self.triplet_ready_counter += 1
+            print(
+                f"Triplet gating: {monitor_split} {metric_name}={metric_value:.5f} "
+                f">= {threshold:.5f} ({self.triplet_ready_counter}/{patience})"
+            )
+        else:
+            if self.triplet_ready_counter > 0:
+                print(
+                    f"Triplet gating reset: {monitor_split} {metric_name}={metric_value:.5f} "
+                    f"< {threshold:.5f}"
+                )
+            self.triplet_ready_counter = 0
+
+        if self.triplet_ready_counter >= patience:
+            self.triplet_enabled = True
+            print(
+                f"Triplet loss activated after epoch {epoch + 1} using "
+                f"{monitor_split} {metric_name} >= {threshold:.5f}"
+            )
+
+    def _load_checkpoint_state(self, checkpoint_path):
+        state_dict = torch.load(checkpoint_path, map_location=self.device)
+        model_to_load = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
+
+        try:
+            model_to_load.load_state_dict(state_dict)
+            return
+        except RuntimeError:
+            pass
+
+        if any(key.startswith("module.") for key in state_dict.keys()):
+            stripped_state_dict = {
+                key[len("module."):]: value for key, value in state_dict.items()
+            }
+            model_to_load.load_state_dict(stripped_state_dict)
+            return
+
+        if isinstance(self.model, nn.DataParallel):
+            wrapped_state_dict = {
+                f"module.{key}": value for key, value in state_dict.items()
+            }
+            self.model.load_state_dict(wrapped_state_dict)
+            return
+
+        raise RuntimeError(
+            f"Could not load checkpoint state from {checkpoint_path}"
+        )
+
+    def _maybe_resume_from_checkpoint(self):
+        checkpoint_path = getattr(self.args, "resume_ckpt", None)
+        if checkpoint_path is None:
+            return
+
+        checkpoint_path = Path(checkpoint_path)
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(f"Resume checkpoint not found: {checkpoint_path}")
+
+        self._load_checkpoint_state(checkpoint_path)
+        print(f"Loaded checkpoint for continued training: {checkpoint_path}")
+
     def _forward_model(self, batch_x):
         if self._use_triplet_loss():
             return self.model(batch_x, return_features=True)
@@ -307,9 +408,12 @@ class Exp_Classification(Exp_Basic):
         if self._use_triplet_loss():
             logits, features = model_outputs
             ce_loss = ce_criterion(logits, labels.long())
-            normalized_features = F.normalize(features, p=2, dim=1)
-            triplet_loss = self.triplet_criterion(normalized_features, labels.long())
-            total_loss = ce_loss + self.args.triplet_weight * triplet_loss
+            if self._is_triplet_active():
+                normalized_features = F.normalize(features, p=2, dim=1)
+                triplet_loss = self.triplet_criterion(normalized_features, labels.long())
+                total_loss = ce_loss + self.args.triplet_weight * triplet_loss
+            else:
+                total_loss = ce_loss
             return total_loss, logits
 
         logits = model_outputs
@@ -406,6 +510,8 @@ class Exp_Classification(Exp_Basic):
 
         model_optim = self._select_optimizer()
         criterion = self._select_criterion()
+        self._reset_triplet_state()
+        self._maybe_resume_from_checkpoint()
 
         for epoch in range(self.args.train_epochs):
             iter_count = 0
@@ -477,8 +583,10 @@ class Exp_Classification(Exp_Basic):
                 f"Recall: {val_metrics_dict['Recall']:.5f}, "
                 f"F1: {val_metrics_dict['F1']:.5f}, "
                 f"AUROC: {val_metrics_dict['AUROC']:.5f}, "
-                f"AUPRC: {val_metrics_dict['AUPRC']:.5f}"
+                f"AUPRC: {val_metrics_dict['AUPRC']:.5f}\n"
+                f"Triplet active: {int(self._is_triplet_active())}"
             )
+            self._maybe_activate_triplet(epoch, train_metrics_dict, val_metrics_dict)
             early_stopping(
                 -val_metrics_dict["F1"],
                 self.model,
@@ -505,10 +613,10 @@ class Exp_Classification(Exp_Basic):
             model_path = checkpoint_dir / "checkpoint.pth"
             if not os.path.exists(model_path):
                 raise Exception("No model found at %s" % model_path)
-            self.model.load_state_dict(torch.load(model_path))
+            self._load_checkpoint_state(model_path)
             
-        # # Uncomment below code for save space on device
-        self.del_weight(path)
+        if not getattr(self.args, "keep_checkpoint", True):
+            self.del_weight(path)
 
         criterion = self._select_criterion()
         vali_loss, val_metrics_dict = self.vali(vali_data, vali_loader, criterion)

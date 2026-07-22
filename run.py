@@ -260,6 +260,65 @@ if __name__ == "__main__":
         default=0.2,
         help="weight of triplet loss in the total objective when --loss ce_triplet",
     )
+    parser.add_argument(
+        "--triplet_enable_strategy",
+        type=str,
+        default="always",
+        choices=["always", "metric"],
+        help=(
+            "when --loss ce_triplet, choose whether to enable triplet from the start "
+            "or activate it after a monitored metric reaches a threshold"
+        ),
+    )
+    parser.add_argument(
+        "--triplet_start_metric",
+        type=str,
+        default="accuracy",
+        choices=[
+            "accuracy",
+            "top1",
+            "top3",
+            "top5",
+            "top10",
+            "precision",
+            "recall",
+            "f1",
+            "auroc",
+            "auprc",
+        ],
+        help="metric name used to trigger triplet loss when --triplet_enable_strategy metric",
+    )
+    parser.add_argument(
+        "--triplet_start_value",
+        type=float,
+        default=0.0,
+        help="metric threshold used to activate triplet loss when --triplet_enable_strategy metric",
+    )
+    parser.add_argument(
+        "--triplet_start_patience",
+        type=int,
+        default=1,
+        help="number of consecutive epochs meeting the threshold before triplet loss is activated",
+    )
+    parser.add_argument(
+        "--triplet_monitor_split",
+        type=str,
+        default="val",
+        choices=["train", "val"],
+        help="which split metric to monitor when --triplet_enable_strategy metric",
+    )
+    parser.add_argument(
+        "--resume_ckpt",
+        type=str_or_none,
+        default=None,
+        help="optional checkpoint path to load before training for continued fine-tuning",
+    )
+    parser.add_argument(
+        "--keep_checkpoint",
+        type=str2bool,
+        default=True,
+        help="whether to keep checkpoint.pth on disk after evaluation finishes",
+    )
 
 
     parser.add_argument(
