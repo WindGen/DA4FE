@@ -20,6 +20,7 @@ from sklearn.metrics import recall_score
 from sklearn.metrics import f1_score
 from sklearn.metrics import roc_auc_score
 from sklearn.metrics import average_precision_score
+from utils.checkpointing import load_model_state
 
 warnings.filterwarnings("ignore")
 
@@ -360,32 +361,7 @@ class Exp_Classification(Exp_Basic):
             )
 
     def _load_checkpoint_state(self, checkpoint_path):
-        state_dict = torch.load(checkpoint_path, map_location=self.device)
-        model_to_load = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
-
-        try:
-            model_to_load.load_state_dict(state_dict)
-            return
-        except RuntimeError:
-            pass
-
-        if any(key.startswith("module.") for key in state_dict.keys()):
-            stripped_state_dict = {
-                key[len("module."):]: value for key, value in state_dict.items()
-            }
-            model_to_load.load_state_dict(stripped_state_dict)
-            return
-
-        if isinstance(self.model, nn.DataParallel):
-            wrapped_state_dict = {
-                f"module.{key}": value for key, value in state_dict.items()
-            }
-            self.model.load_state_dict(wrapped_state_dict)
-            return
-
-        raise RuntimeError(
-            f"Could not load checkpoint state from {checkpoint_path}"
-        )
+        load_model_state(self.model, checkpoint_path, map_location=self.device)
 
     def _maybe_resume_from_checkpoint(self):
         checkpoint_path = getattr(self.args, "resume_ckpt", None)
