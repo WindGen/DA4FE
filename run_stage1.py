@@ -36,7 +36,11 @@ def build_stage1_full_setting(args):
         f"{args.model}_{args.data}_seed_{args.seed}_dm_{args.d_model}_dp_{args.dropout}"
         f"_tl_{args.t_layer}_vl_{args.v_layer}_fl_{args.f_layer}_bs_{args.batch_size}"
         f"_lr{args.learning_rate}_aug_{args.augmentations}_pl_{args.patch_len}"
-        f"_trip_{args.stage1_triplet_type}_tm_{args.stage1_triplet_margin}"
+        f"_loss_{args.stage1_loss}_trip_{args.stage1_triplet_type}_tm_{args.stage1_triplet_margin}"
+        f"_cew_{args.stage1_ce_weight}_tw_{args.stage1_triplet_weight}"
+        f"_ls_{args.stage1_label_smoothing}"
+        f"_afs_{args.stage1_arcface_s}_afm_{args.stage1_arcface_m}"
+        f"_cfs_{args.stage1_cosface_s}_cfm_{args.stage1_cosface_m}"
         f"_eegnorm_{int(args.eeg_normalize)}_eegcls_{args.eeg_num_classes}"
     )
     if args.model == "DA4FE":
@@ -126,17 +130,74 @@ if __name__ == "__main__":
     parser.add_argument("--learning_rate", type=float, default=1e-4)
 
     parser.add_argument(
+        "--stage1_loss",
+        type=str,
+        default="triplet",
+        choices=[
+            "triplet",
+            "ce",
+            "ce_triplet",
+            "arcface",
+            "arcface_triplet",
+            "cosface",
+            "cosface_triplet",
+        ],
+        help="stage1 loss type",
+    )
+    parser.add_argument(
         "--stage1_triplet_type",
         type=str,
         default="semihard",
         choices=["semihard", "batch_hard"],
-        help="triplet loss type for feature extraction training",
+        help="triplet miner type when stage1 loss includes triplet",
     )
     parser.add_argument(
         "--stage1_triplet_margin",
         type=float,
+        default=0.2,
+        help="margin used by stage1 triplet loss",
+    )
+    parser.add_argument(
+        "--stage1_ce_weight",
+        type=float,
         default=1.0,
-        help="margin used by stage-1 triplet loss",
+        help="weight of cross-entropy style loss when stage1 loss includes classification supervision",
+    )
+    parser.add_argument(
+        "--stage1_triplet_weight",
+        type=float,
+        default=1.0,
+        help="weight of triplet loss when stage1 loss includes triplet supervision",
+    )
+    parser.add_argument(
+        "--stage1_label_smoothing",
+        type=float,
+        default=0.0,
+        help="label smoothing used by CE, ArcFace, and CosFace losses",
+    )
+    parser.add_argument(
+        "--stage1_arcface_s",
+        type=float,
+        default=30.0,
+        help="ArcFace scale parameter",
+    )
+    parser.add_argument(
+        "--stage1_arcface_m",
+        type=float,
+        default=0.5,
+        help="ArcFace angular margin",
+    )
+    parser.add_argument(
+        "--stage1_cosface_s",
+        type=float,
+        default=30.0,
+        help="CosFace scale parameter",
+    )
+    parser.add_argument(
+        "--stage1_cosface_m",
+        type=float,
+        default=0.35,
+        help="CosFace cosine margin",
     )
     parser.add_argument(
         "--stage1_kmeans_clusters",
@@ -148,7 +209,7 @@ if __name__ == "__main__":
         "--stage1_samples_per_class",
         type=int,
         default=2,
-        help="number of samples per class inside each stage1 batch; must be >= 2 for triplet training",
+        help="number of samples per class inside each stage1 batch when triplet loss is used",
     )
     parser.add_argument("--resume_ckpt", type=str_or_none, default=None)
     parser.add_argument("--keep_checkpoint", type=str2bool, default=True)

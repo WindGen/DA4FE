@@ -8,9 +8,12 @@ def unwrap_model(model):
     return model.module if isinstance(model, nn.DataParallel) else model
 
 
-def extract_model_state(checkpoint):
-    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-        return checkpoint["model_state_dict"]
+def extract_model_state(checkpoint, state_key="model_state_dict"):
+    if isinstance(checkpoint, dict):
+        if state_key in checkpoint:
+            return checkpoint[state_key]
+        if state_key != "model_state_dict" and "model_state_dict" in checkpoint:
+            return checkpoint["model_state_dict"]
     return checkpoint
 
 
@@ -20,9 +23,9 @@ def load_checkpoint_object(checkpoint_or_path, map_location=None):
     return checkpoint_or_path
 
 
-def load_model_state(model, checkpoint_or_path, map_location=None):
+def load_model_state(model, checkpoint_or_path, map_location=None, state_key="model_state_dict"):
     checkpoint = load_checkpoint_object(checkpoint_or_path, map_location=map_location)
-    state_dict = extract_model_state(checkpoint)
+    state_dict = extract_model_state(checkpoint, state_key=state_key)
 
     try:
         unwrap_model(model).load_state_dict(state_dict)
@@ -43,6 +46,18 @@ def load_model_state(model, checkpoint_or_path, map_location=None):
         }
         model.load_state_dict(wrapped_state_dict)
         return checkpoint
+
+    if (
+        isinstance(checkpoint, dict)
+        and state_key == "model_state_dict"
+        and "backbone_state_dict" in checkpoint
+    ):
+        return load_model_state(
+            model,
+            checkpoint,
+            map_location=map_location,
+            state_key="backbone_state_dict",
+        )
 
     raise RuntimeError("Could not load checkpoint into model state")
 

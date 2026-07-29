@@ -289,7 +289,12 @@ class Exp_Stage2_Classifier(Exp_Basic):
         print(self._dataset_summary(test_data, "TEST"))
         self._prepare_metric_logging(setting, train_data, vali_data, test_data)
 
-        load_model_state(self.model, self.args.resume_ckpt, map_location=self.device)
+        load_model_state(
+            self.model,
+            self.args.resume_ckpt,
+            map_location=self.device,
+            state_key="backbone_state_dict",
+        )
         print(f"Loaded stage1 feature checkpoint: {self.args.resume_ckpt}")
 
         train_x, train_y = self._extract_split_features(train_loader)

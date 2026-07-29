@@ -10,131 +10,188 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch import optim
 from torch.utils.data import BatchSampler, DataLoader
 
 from data_provider.data_factory import data_provider
 from data_provider.uea import collate_fn
 from exp.exp_basic import Exp_Basic
-from utils.checkpointing import build_checkpoint_payload, load_checkpoint_object, load_model_state
+from utils.checkpointing import (
+    build_checkpoint_payload,
+    load_checkpoint_object,
+    load_model_state,
+    unwrap_model,
+)
 from utils.stage_metrics import compute_kmeans_score
 from utils.tools import adjust_learning_rate
 
 warnings.filterwarnings("ignore")
 
 
-class BatchHardTripletLoss(nn.Module):
-    def __init__(self, margin=0.2):
+class ArcMarginHead(nn.Module):
+    def __init__(self, in_features, out_features, s=30.0, m=0.5, easy_margin=False):
         super().__init__()
-        self.margin = margin
+        self.in_features = in_features
+        self.out_features = out_features
+        self.s = float(s)
+        self.m = float(m)
+        self.easy_margin = easy_margin
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        nn.init.xavier_uniform_(self.weight)
+
+        self.cos_m = np.cos(self.m)
+        self.sin_m = np.sin(self.m)
+        self.th = np.cos(np.pi - self.m)
+        self.mm = np.sin(np.pi - self.m) * self.m
 
     def forward(self, features, labels):
-        if features.ndim != 2:
-            raise ValueError("Triplet features must be a 2D tensor")
+        cosine = F.linear(F.normalize(features), F.normalize(self.weight))
+        sine = torch.sqrt(torch.clamp(1.0 - cosine.pow(2), min=1e-7))
+        phi = cosine * self.cos_m - sine * self.sin_m
+        if self.easy_margin:
+            phi = torch.where(cosine > 0, phi, cosine)
+        else:
+            phi = torch.where(cosine > self.th, phi, cosine - self.mm)
+
+        one_hot = F.one_hot(labels.long(), num_classes=self.out_features).float()
+        output = one_hot * phi + (1.0 - one_hot) * cosine
+        return output * self.s
+
+
+class CosMarginHead(nn.Module):
+    def __init__(self, in_features, out_features, s=30.0, m=0.35):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.s = float(s)
+        self.m = float(m)
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        nn.init.xavier_uniform_(self.weight)
+
+    def forward(self, features, labels):
+        cosine = F.linear(F.normalize(features), F.normalize(self.weight))
+        one_hot = F.one_hot(labels.long(), num_classes=self.out_features).float()
+        output = cosine - one_hot * self.m
+        return output * self.s
+
+
+class Stage1FeatureModel(nn.Module):
+    def __init__(self, backbone, feature_dim, num_class, args):
+        super().__init__()
+        self.backbone = backbone
+        self.feature_dim = feature_dim
+        self.num_class = num_class
+        self.loss_mode = getattr(args, "stage1_loss", "triplet").lower()
+        self.margin_head = None
+
+        if self.loss_mode in {"arcface", "arcface_triplet"}:
+            self.margin_head = ArcMarginHead(
+                in_features=feature_dim,
+                out_features=num_class,
+                s=getattr(args, "stage1_arcface_s", 30.0),
+                m=getattr(args, "stage1_arcface_m", 0.5),
+            )
+        elif self.loss_mode in {"cosface", "cosface_triplet"}:
+            self.margin_head = CosMarginHead(
+                in_features=feature_dim,
+                out_features=num_class,
+                s=getattr(args, "stage1_cosface_s", 30.0),
+                m=getattr(args, "stage1_cosface_m", 0.35),
+            )
+
+    def forward(self, x_enc, return_features=False):
+        logits, fused = self.backbone(x_enc, return_features=True)
+        if return_features:
+            return logits, fused
+        return logits
+
+
+class TripletMarginMiner:
+    def __init__(self, margin=0.2, miner_type="semihard"):
+        self.margin = float(margin)
+        self.miner_type = miner_type
+        if self.miner_type not in {"semihard", "batch_hard"}:
+            raise ValueError(f"Unsupported stage1 miner type: {self.miner_type}")
+
+    def __call__(self, embeddings, labels):
+        if embeddings.ndim != 2:
+            raise ValueError("Triplet embeddings must be a 2D tensor")
 
         labels = labels.reshape(-1)
         batch_size = labels.size(0)
         if batch_size < 2:
-            return features.new_zeros(())
+            return None
 
-        distances = torch.cdist(features, features, p=2)
-        same_label = labels.unsqueeze(0).eq(labels.unsqueeze(1))
-        diag_mask = torch.eye(batch_size, device=labels.device, dtype=torch.bool)
-        positive_mask = same_label & ~diag_mask
-        negative_mask = ~same_label
+        with torch.no_grad():
+            distances = torch.cdist(embeddings.detach(), embeddings.detach(), p=2)
+            same_label = labels.unsqueeze(0).eq(labels.unsqueeze(1))
+            diag_mask = torch.eye(batch_size, device=labels.device, dtype=torch.bool)
+            positive_mask = same_label & ~diag_mask
+            negative_mask = ~same_label
 
-        valid = positive_mask.any(dim=1) & negative_mask.any(dim=1)
-        if not valid.any():
-            return features.new_zeros(())
+            anchors = []
+            positives = []
+            negatives = []
 
-        hardest_positive = distances.masked_fill(
-            ~positive_mask, float("-inf")
-        ).max(dim=1).values
-        hardest_negative = distances.masked_fill(
-            ~negative_mask, float("inf")
-        ).min(dim=1).values
-        losses = torch.relu(
-            hardest_positive[valid] - hardest_negative[valid] + self.margin
-        )
-        return losses.mean()
+            for anchor_idx in range(batch_size):
+                positive_idx = torch.nonzero(
+                    positive_mask[anchor_idx], as_tuple=False
+                ).flatten()
+                negative_idx = torch.nonzero(
+                    negative_mask[anchor_idx], as_tuple=False
+                ).flatten()
 
+                if positive_idx.numel() == 0 or negative_idx.numel() == 0:
+                    continue
 
-class TripletSemiHardLoss(nn.Module):
-    def masked_maximum(self, data, mask, dim=1):
-        axis_minimums = torch.min(data, dim, keepdim=True).values
+                positive_distances = distances[anchor_idx, positive_idx]
+                hardest_positive = positive_idx[positive_distances.argmax()]
+                hardest_negative = negative_idx[
+                    distances[anchor_idx, negative_idx].argmin()
+                ]
+
+                if self.miner_type == "batch_hard":
+                    anchors.append(anchor_idx)
+                    positives.append(int(hardest_positive))
+                    negatives.append(int(hardest_negative))
+                    continue
+
+                selected = False
+                sorted_positive_positions = torch.argsort(
+                    positive_distances, descending=True
+                )
+                for pos_position in sorted_positive_positions:
+                    candidate_positive = positive_idx[pos_position]
+                    d_ap = distances[anchor_idx, candidate_positive]
+                    negative_distances = distances[anchor_idx, negative_idx]
+                    semi_hard_mask = (
+                        (negative_distances > d_ap)
+                        & (negative_distances < d_ap + self.margin)
+                    )
+                    if semi_hard_mask.any():
+                        semi_hard_negatives = negative_idx[semi_hard_mask]
+                        selected_negative = semi_hard_negatives[
+                            distances[anchor_idx, semi_hard_negatives].argmin()
+                        ]
+                        anchors.append(anchor_idx)
+                        positives.append(int(candidate_positive))
+                        negatives.append(int(selected_negative))
+                        selected = True
+                        break
+
+                if not selected:
+                    anchors.append(anchor_idx)
+                    positives.append(int(hardest_positive))
+                    negatives.append(int(hardest_negative))
+
+        if not anchors:
+            return None
+
         return (
-            torch.max(torch.mul(data - axis_minimums, mask), dim, keepdim=True).values
-            + axis_minimums
-        )
-
-    def masked_minimum(self, data, mask, dim=1):
-        axis_maximums = torch.max(data, dim, keepdim=True).values
-        return (
-            torch.min(torch.mul(data - axis_maximums, mask), dim, keepdim=True).values
-            + axis_maximums
-        )
-
-    def pairwise_distance(self, embeddings, squared=True):
-        pairwise_distances_squared = (
-            torch.sum(embeddings**2, dim=1, keepdim=True)
-            + torch.sum(embeddings.t() ** 2, dim=0, keepdim=True)
-            - 2.0 * torch.matmul(embeddings, embeddings.t())
-        )
-
-        error_mask = pairwise_distances_squared <= 0.0
-        if squared:
-            pairwise_distances = pairwise_distances_squared.clamp(min=0)
-        else:
-            pairwise_distances = pairwise_distances_squared.clamp(min=1e-16).sqrt()
-
-        pairwise_distances = torch.mul(pairwise_distances, ~error_mask)
-        num_data = embeddings.shape[0]
-        mask_offdiagonals = torch.ones_like(pairwise_distances) - torch.diag(
-            torch.ones([num_data], device=embeddings.device)
-        )
-        pairwise_distances = torch.mul(pairwise_distances, mask_offdiagonals)
-        return pairwise_distances
-
-    def forward(self, embeddings, target, margin=1.0, squared=True):
-        labels = target.int().unsqueeze(-1)
-        pdist_matrix = self.pairwise_distance(embeddings, squared=squared)
-        adjacency = labels == torch.transpose(labels, 0, 1)
-        adjacency_not = ~adjacency
-        batch_size = labels.shape[0]
-
-        pdist_matrix_tile = pdist_matrix.repeat([batch_size, 1])
-        mask = adjacency_not.repeat([batch_size, 1]) & (
-            pdist_matrix_tile
-            > torch.reshape(torch.transpose(pdist_matrix, 0, 1), [-1, 1])
-        )
-        mask_final = torch.reshape(
-            torch.sum(mask.float(), 1, keepdim=True) > 0.0, [batch_size, batch_size]
-        )
-        mask_final = torch.transpose(mask_final, 0, 1)
-
-        adjacency_not = adjacency_not.float()
-        mask = mask.float()
-
-        negatives_outside = torch.reshape(
-            self.masked_minimum(pdist_matrix_tile, mask), [batch_size, batch_size]
-        )
-        negatives_outside = torch.transpose(negatives_outside, 0, 1)
-
-        negatives_inside = self.masked_maximum(
-            pdist_matrix, adjacency_not
-        ).repeat([1, batch_size])
-        semi_hard_negatives = torch.where(mask_final, negatives_outside, negatives_inside)
-
-        loss_mat = torch.add(margin, pdist_matrix - semi_hard_negatives)
-        mask_positives = adjacency.float() - torch.diag(
-            torch.ones([batch_size], device=embeddings.device)
-        )
-        num_positives = torch.sum(mask_positives)
-        if num_positives.item() == 0:
-            return embeddings.new_zeros(())
-        return torch.div(
-            torch.sum(torch.mul(loss_mat, mask_positives).clamp(min=0.0)),
-            num_positives,
+            torch.tensor(anchors, device=embeddings.device, dtype=torch.long),
+            torch.tensor(positives, device=embeddings.device, dtype=torch.long),
+            torch.tensor(negatives, device=embeddings.device, dtype=torch.long),
         )
 
 
@@ -223,13 +280,23 @@ class Exp_Stage1_Feature(Exp_Basic):
         "epoch",
         "split",
         "loss",
+        "classification_loss",
+        "metric_loss",
         "kmeans_score",
+        "mined_triplets",
         "learning_rate",
         "epoch_time_sec",
         "steps",
     ]
 
+    TRIPLET_LOSS_MODES = {"triplet", "ce_triplet", "arcface_triplet", "cosface_triplet"}
+    CLASSIFICATION_LOSS_MODES = {"ce", "ce_triplet", "arcface", "arcface_triplet", "cosface", "cosface_triplet"}
+
     def __init__(self, args):
+        self.loss_mode = getattr(args, "stage1_loss", "triplet").lower()
+        self.triplet_miner = None
+        self.triplet_criterion = None
+        self.classification_criterion = None
         super().__init__(args)
         self.metrics_log_path = None
         self.split_summary_path = None
@@ -333,7 +400,10 @@ class Exp_Stage1_Feature(Exp_Basic):
         epoch,
         split,
         loss,
+        classification_loss,
+        metric_loss,
         kmeans_score,
+        mined_triplets=None,
         learning_rate=None,
         epoch_time=None,
         steps=None,
@@ -345,7 +415,10 @@ class Exp_Stage1_Feature(Exp_Basic):
             "epoch": epoch,
             "split": split,
             "loss": float(loss),
+            "classification_loss": float(classification_loss),
+            "metric_loss": float(metric_loss),
             "kmeans_score": float(kmeans_score),
+            "mined_triplets": "" if mined_triplets is None else int(mined_triplets),
             "learning_rate": "" if learning_rate is None else float(learning_rate),
             "epoch_time_sec": "" if epoch_time is None else float(epoch_time),
             "steps": "" if steps is None else int(steps),
@@ -358,13 +431,29 @@ class Exp_Stage1_Feature(Exp_Basic):
         requested_clusters = int(getattr(self.args, "stage1_kmeans_clusters", 0))
         return requested_clusters if requested_clusters > 0 else self.args.num_class
 
+    def _infer_backbone_feature_dim(self, backbone):
+        with torch.no_grad():
+            dummy_input = torch.zeros(1, self.args.seq_len, self.args.enc_in)
+            _, fused = backbone(dummy_input, return_features=True)
+        return int(fused.shape[-1])
+
     def _build_model(self):
         test_data, _ = self._get_data(flag="TEST")
         self.args.seq_len = self._dataset_seq_len(test_data)
         self.args.pred_len = 0
         self.args.enc_in = self._dataset_feature_dim(test_data)
         self.args.num_class = self._dataset_num_class(test_data)
-        model = self.model_dict[self.args.model].Model(self.args).float()
+
+        backbone = self.model_dict[self.args.model].Model(self.args).float()
+        feature_dim = self._infer_backbone_feature_dim(backbone)
+        self.args.stage1_backbone_feature_dim = feature_dim
+
+        model = Stage1FeatureModel(
+            backbone=backbone,
+            feature_dim=feature_dim,
+            num_class=self.args.num_class,
+            args=self.args,
+        ).float()
         if self.args.use_multi_gpu and self.args.use_gpu:
             model = nn.DataParallel(model, device_ids=self.args.device_ids)
         return model
@@ -373,7 +462,23 @@ class Exp_Stage1_Feature(Exp_Basic):
         random.seed(self.args.seed)
         return data_provider(self.args, flag)
 
+    def _use_triplet_loss(self):
+        return self.loss_mode in self.TRIPLET_LOSS_MODES
+
+    def _use_classification_loss(self):
+        return self.loss_mode in self.CLASSIFICATION_LOSS_MODES
+
     def _build_train_loader(self, train_data):
+        if not self._use_triplet_loss():
+            return DataLoader(
+                train_data,
+                batch_size=self.args.batch_size,
+                shuffle=True,
+                num_workers=self.args.num_workers,
+                drop_last=False,
+                collate_fn=lambda x: collate_fn(x, max_len=self.args.seq_len),
+            )
+
         sampler = ClassBalancedBatchSampler(
             labels=train_data.y,
             batch_size=self.args.batch_size,
@@ -402,41 +507,106 @@ class Exp_Stage1_Feature(Exp_Basic):
         return optim.Adam(self.model.parameters(), lr=self.args.learning_rate)
 
     def _select_criterion(self):
-        if self.args.stage1_triplet_type == "semihard":
-            return TripletSemiHardLoss()
-        if self.args.stage1_triplet_type == "batch_hard":
-            return BatchHardTripletLoss(margin=self.args.stage1_triplet_margin)
-        raise ValueError(
-            f"Unsupported stage1_triplet_type: {self.args.stage1_triplet_type}"
+        self.classification_criterion = nn.CrossEntropyLoss(
+            label_smoothing=float(getattr(self.args, "stage1_label_smoothing", 0.0))
         )
 
+        if self._use_triplet_loss():
+            self.triplet_miner = TripletMarginMiner(
+                margin=self.args.stage1_triplet_margin,
+                miner_type=self.args.stage1_triplet_type,
+            )
+            self.triplet_criterion = nn.TripletMarginLoss(
+                margin=self.args.stage1_triplet_margin,
+                p=2,
+                reduction="mean",
+            )
+        else:
+            self.triplet_miner = None
+            self.triplet_criterion = None
+
     def _extract_features(self, batch_x):
-        model_outputs = self.model(batch_x, return_features=True)
-        _, features = model_outputs
-        return nn.functional.normalize(features, p=2, dim=1)
+        logits, fused_features = self.model(batch_x, return_features=True)
+        embeddings = F.normalize(fused_features, p=2, dim=1)
+        return logits, fused_features, embeddings
 
-    def _compute_triplet_loss(self, criterion, features, labels):
-        if isinstance(criterion, TripletSemiHardLoss):
-            return criterion(features, labels.long(), margin=self.args.stage1_triplet_margin)
-        return criterion(features, labels.long())
+    def _compute_triplet_component(self, embeddings, labels):
+        if not self._use_triplet_loss():
+            return embeddings.sum() * 0.0, 0
 
-    def _evaluate_loader(self, data_loader, criterion):
+        triplets = self.triplet_miner(embeddings, labels.long())
+        if triplets is None:
+            return embeddings.sum() * 0.0, 0
+
+        anchor_idx, positive_idx, negative_idx = triplets
+        loss = self.triplet_criterion(
+            embeddings[anchor_idx],
+            embeddings[positive_idx],
+            embeddings[negative_idx],
+        )
+        return loss, int(anchor_idx.numel())
+
+    def _compute_classification_component(self, logits, embeddings, labels):
+        if not self._use_classification_loss():
+            return embeddings.sum() * 0.0
+
+        stage1_model = unwrap_model(self.model)
+        if self.loss_mode in {"arcface", "arcface_triplet", "cosface", "cosface_triplet"}:
+            if stage1_model.margin_head is None:
+                raise RuntimeError(
+                    f"stage1 margin head is missing for loss mode {self.loss_mode}"
+                )
+            margin_logits = stage1_model.margin_head(embeddings, labels.long())
+            return self.classification_criterion(margin_logits, labels.long())
+
+        return self.classification_criterion(logits, labels.long())
+
+    def _compute_total_loss(self, logits, embeddings, labels):
+        classification_loss = self._compute_classification_component(
+            logits, embeddings, labels
+        )
+        metric_loss, mined_triplets = self._compute_triplet_component(embeddings, labels)
+
+        total_loss = logits.sum() * 0.0
+        if self._use_classification_loss():
+            total_loss = total_loss + self.args.stage1_ce_weight * classification_loss
+        if self._use_triplet_loss():
+            total_loss = total_loss + self.args.stage1_triplet_weight * metric_loss
+
+        return (
+            total_loss,
+            float(classification_loss.detach().item()),
+            float(metric_loss.detach().item()),
+            mined_triplets,
+        )
+
+    def _evaluate_loader(self, data_loader):
         total_loss = []
+        classification_losses = []
+        metric_losses = []
         feature_rows = []
         label_rows = []
+        mined_triplets = 0
 
         self.model.eval()
         with torch.no_grad():
             for batch_x, label, padding_mask in data_loader:
                 batch_x = batch_x.float().to(self.device)
                 label = label.to(self.device)
-                features = self._extract_features(batch_x)
-                loss = self._compute_triplet_loss(criterion, features, label)
+                logits, fused_features, embeddings = self._extract_features(batch_x)
+                loss, classification_loss, metric_loss, batch_triplets = self._compute_total_loss(
+                    logits, embeddings, label
+                )
                 total_loss.append(loss.item())
-                feature_rows.append(features.cpu().numpy())
+                classification_losses.append(classification_loss)
+                metric_losses.append(metric_loss)
+                mined_triplets += batch_triplets
+                feature_rows.append(embeddings.cpu().numpy())
                 label_rows.append(label.detach().cpu().numpy())
 
         total_loss = float(np.average(total_loss))
+        classification_loss = float(np.average(classification_losses))
+        metric_loss = float(np.average(metric_losses))
         embeddings = np.concatenate(feature_rows, axis=0)
         labels = np.concatenate(label_rows, axis=0)
         kmeans_score = compute_kmeans_score(
@@ -446,7 +616,7 @@ class Exp_Stage1_Feature(Exp_Basic):
             random_state=self.args.seed,
         )
         self.model.train()
-        return total_loss, kmeans_score
+        return total_loss, classification_loss, metric_loss, kmeans_score, mined_triplets
 
     def _maybe_resume_from_checkpoint(self):
         checkpoint_path = getattr(self.args, "resume_ckpt", None)
@@ -480,14 +650,17 @@ class Exp_Stage1_Feature(Exp_Basic):
 
         train_steps = len(train_loader)
         model_optim = self._select_optimizer()
-        criterion = self._select_criterion()
+        self._select_criterion()
         self._maybe_resume_from_checkpoint()
 
         best_val_kmeans = -np.inf
         early_stop_counter = 0
 
         for epoch in range(self.args.train_epochs):
-            train_loss = []
+            step_total_losses = []
+            step_classification_losses = []
+            step_metric_losses = []
+            step_mined_triplets = []
 
             self.model.train()
             epoch_time = time.time()
@@ -496,9 +669,15 @@ class Exp_Stage1_Feature(Exp_Basic):
 
                 batch_x = batch_x.float().to(self.device)
                 label = label.to(self.device)
-                features = self._extract_features(batch_x)
-                loss = self._compute_triplet_loss(criterion, features, label)
-                train_loss.append(loss.item())
+                logits, fused_features, embeddings = self._extract_features(batch_x)
+                loss, classification_loss, metric_loss, batch_triplets = self._compute_total_loss(
+                    logits, embeddings, label
+                )
+
+                step_total_losses.append(loss.item())
+                step_classification_losses.append(classification_loss)
+                step_metric_losses.append(metric_loss)
+                step_mined_triplets.append(batch_triplets)
 
                 loss.backward()
                 nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=4.0)
@@ -506,16 +685,35 @@ class Exp_Stage1_Feature(Exp_Basic):
 
             epoch_time_cost = time.time() - epoch_time
             print(f"Epoch: {epoch + 1} cost time: {epoch_time_cost}")
-            train_step_loss = float(np.average(train_loss))
-            train_eval_loss, train_kmeans = self._evaluate_loader(train_eval_loader, criterion)
-            val_loss, val_kmeans = self._evaluate_loader(vali_loader, criterion)
+            train_step_loss = float(np.average(step_total_losses))
+            train_step_cls_loss = float(np.average(step_classification_losses))
+            train_step_metric_loss = float(np.average(step_metric_losses))
+            train_step_triplets = int(np.sum(step_mined_triplets))
+
+            (
+                train_eval_loss,
+                train_eval_cls_loss,
+                train_eval_metric_loss,
+                train_kmeans,
+                train_eval_triplets,
+            ) = self._evaluate_loader(train_eval_loader)
+            (
+                val_loss,
+                val_cls_loss,
+                val_metric_loss,
+                val_kmeans,
+                val_triplets,
+            ) = self._evaluate_loader(vali_loader)
             current_lr = model_optim.param_groups[0]["lr"]
 
             self._append_metric_row(
                 epoch=epoch + 1,
                 split="train",
                 loss=train_eval_loss,
+                classification_loss=train_eval_cls_loss,
+                metric_loss=train_eval_metric_loss,
                 kmeans_score=train_kmeans,
+                mined_triplets=train_eval_triplets,
                 learning_rate=current_lr,
                 epoch_time=epoch_time_cost,
                 steps=train_steps,
@@ -524,28 +722,41 @@ class Exp_Stage1_Feature(Exp_Basic):
                 epoch=epoch + 1,
                 split="val",
                 loss=val_loss,
+                classification_loss=val_cls_loss,
+                metric_loss=val_metric_loss,
                 kmeans_score=val_kmeans,
+                mined_triplets=val_triplets,
                 learning_rate=current_lr,
                 epoch_time=epoch_time_cost,
                 steps=train_steps,
             )
 
             print(
-                f"Epoch: {epoch + 1}, Steps: {train_steps}, | Train Step Loss: {train_step_loss:.5f}\n"
-                f"Train feature results --- Loss: {train_eval_loss:.5f}, KMeans: {train_kmeans:.5f}\n"
-                f"Validation feature results --- Loss: {val_loss:.5f}, KMeans: {val_kmeans:.5f}"
+                f"Epoch: {epoch + 1}, Steps: {train_steps}, | "
+                f"Train Step Loss: {train_step_loss:.5f}, "
+                f"Cls: {train_step_cls_loss:.5f}, Metric: {train_step_metric_loss:.5f}\n"
+                f"Train feature results --- Loss: {train_eval_loss:.5f}, Cls: {train_eval_cls_loss:.5f}, "
+                f"Metric: {train_eval_metric_loss:.5f}, KMeans: {train_kmeans:.5f}, "
+                f"MinedTriplets(step/eval): {train_step_triplets}/{train_eval_triplets}\n"
+                f"Validation feature results --- Loss: {val_loss:.5f}, Cls: {val_cls_loss:.5f}, "
+                f"Metric: {val_metric_loss:.5f}, KMeans: {val_kmeans:.5f}, "
+                f"MinedTriplets: {val_triplets}"
             )
 
             if val_kmeans > best_val_kmeans + 1e-6:
                 best_val_kmeans = val_kmeans
                 early_stop_counter = 0
+                stage1_model = unwrap_model(self.model)
                 checkpoint_payload = build_checkpoint_payload(
                     self.model,
                     optimizer=model_optim,
                     epoch=epoch,
                     best_metric=best_val_kmeans,
                     args_dict=vars(deepcopy(self.args)),
-                    extra={"stage": "stage1_feature_training"},
+                    extra={
+                        "stage": "stage1_feature_training",
+                        "backbone_state_dict": stage1_model.backbone.state_dict(),
+                    },
                 )
                 torch.save(checkpoint_payload, checkpoint_dir / "checkpoint.pth")
                 print(
@@ -578,26 +789,46 @@ class Exp_Stage1_Feature(Exp_Basic):
         if best_model_path.exists():
             load_model_state(self.model, best_model_path, map_location=self.device)
 
-        criterion = self._select_criterion()
-        val_loss, val_kmeans = self._evaluate_loader(vali_loader, criterion)
-        test_loss, test_kmeans = self._evaluate_loader(test_loader, criterion)
+        self._select_criterion()
+        (
+            val_loss,
+            val_cls_loss,
+            val_metric_loss,
+            val_kmeans,
+            val_triplets,
+        ) = self._evaluate_loader(vali_loader)
+        (
+            test_loss,
+            test_cls_loss,
+            test_metric_loss,
+            test_kmeans,
+            test_triplets,
+        ) = self._evaluate_loader(test_loader)
 
         self._append_metric_row(
             epoch="final",
             split="val_final",
             loss=val_loss,
+            classification_loss=val_cls_loss,
+            metric_loss=val_metric_loss,
             kmeans_score=val_kmeans,
+            mined_triplets=val_triplets,
         )
         self._append_metric_row(
             epoch="final",
             split="test_final",
             loss=test_loss,
+            classification_loss=test_cls_loss,
+            metric_loss=test_metric_loss,
             kmeans_score=test_kmeans,
+            mined_triplets=test_triplets,
         )
 
         print(
-            f"Final validation feature results --- Loss: {val_loss:.5f}, KMeans: {val_kmeans:.5f}\n"
-            f"Final test feature results --- Loss: {test_loss:.5f}, KMeans: {test_kmeans:.5f}"
+            f"Final validation feature results --- Loss: {val_loss:.5f}, Cls: {val_cls_loss:.5f}, "
+            f"Metric: {val_metric_loss:.5f}, KMeans: {val_kmeans:.5f}, MinedTriplets: {val_triplets}\n"
+            f"Final test feature results --- Loss: {test_loss:.5f}, Cls: {test_cls_loss:.5f}, "
+            f"Metric: {test_metric_loss:.5f}, KMeans: {test_kmeans:.5f}, MinedTriplets: {test_triplets}"
         )
 
         if not getattr(self.args, "keep_checkpoint", True):
