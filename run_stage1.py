@@ -38,6 +38,7 @@ def build_stage1_full_setting(args):
         f"_lr{args.learning_rate}_aug_{args.augmentations}_pl_{args.patch_len}"
         f"_loss_{args.stage1_loss}_trip_{args.stage1_triplet_type}_tm_{args.stage1_triplet_margin}"
         f"_cew_{args.stage1_ce_weight}_tw_{args.stage1_triplet_weight}"
+        f"_useval_{int(getattr(args, 'use_validation', True))}"
         f"_ls_{args.stage1_label_smoothing}"
         f"_afs_{args.stage1_arcface_s}_afm_{args.stage1_arcface_m}"
         f"_cfs_{args.stage1_cosface_s}_cfm_{args.stage1_cosface_m}"
@@ -57,7 +58,12 @@ def build_stage1_full_setting(args):
 def build_run_directory_name(args, stage_name):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     candidate = timestamp
-    roots = [Path("./checkpoints") / args.model / stage_name]
+    result_root = getattr(args, "result_dir", None)
+    if result_root is None:
+        result_root = Path(__file__).resolve().parent.parent / "result"
+    else:
+        result_root = Path(result_root).expanduser()
+    roots = [result_root / args.model / stage_name]
     if args.log_dir is not None:
         roots.append(Path(args.log_dir) / args.data / stage_name)
 
@@ -213,6 +219,23 @@ if __name__ == "__main__":
     )
     parser.add_argument("--resume_ckpt", type=str_or_none, default=None)
     parser.add_argument("--keep_checkpoint", type=str2bool, default=True)
+    parser.add_argument(
+        "--use_validation",
+        "--use_val",
+        type=str2bool,
+        default=True,
+        help=(
+            "whether to keep a validation split for checkpoint selection; "
+            "when false, validation samples are merged into training and test "
+            "KMeans selects the best checkpoint"
+        ),
+    )
+    parser.add_argument(
+        "--result_dir",
+        type=str_or_none,
+        default=None,
+        help="root directory for outputs; default is ../result next to the source tree",
+    )
 
     parser.add_argument("--lradj", type=str, default="cosine")
     parser.add_argument("--use_amp", action="store_true", default=False)
@@ -224,6 +247,8 @@ if __name__ == "__main__":
     parser.add_argument("--devices", type=str, default="0,1,2,3")
 
     args = parser.parse_args()
+    if args.result_dir is None:
+        args.result_dir = str(Path(__file__).resolve().parent.parent / "result")
     args.requested_seq_len = args.seq_len
     args.use_gpu = True if torch.cuda.is_available() and args.use_gpu else False
 

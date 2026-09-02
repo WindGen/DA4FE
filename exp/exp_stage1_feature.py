@@ -12,7 +12,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import optim
-from torch.utils.data import BatchSampler, DataLoader
+from torch.utils.data import BatchSampler, ConcatDataset, DataLoader
 
 from data_provider.data_factory import data_provider
 from data_provider.uea import collate_fn
@@ -275,6 +275,41 @@ class ClassBalancedBatchSampler(BatchSampler):
         return int(np.ceil(len(self.labels) / self.batch_size))
 
 
+class MergedStage1Dataset(ConcatDataset):
+    """Concatenate train and validation datasets while preserving metadata.
+
+    The stage-1 sampler and model builder rely on ``y``/``num_class`` and the
+    sequence metadata exposed by the individual dataset implementations.
+    ``torch.utils.data.ConcatDataset`` only implements indexing, so this small
+    adapter carries those attributes over to the merged training split.
+    """
+
+    def __init__(self, *datasets):
+        datasets = tuple(dataset for dataset in datasets if dataset is not None)
+        if not datasets:
+            raise ValueError("At least one dataset is required")
+        super().__init__(datasets)
+
+        labels = []
+        for dataset in datasets:
+            if not hasattr(dataset, "y"):
+                raise AttributeError("Stage-1 datasets must expose a `y` label array")
+            labels.append(np.asarray(dataset.y, dtype=np.int64).reshape(-1))
+        self.y = np.concatenate(labels, axis=0)
+
+        first = datasets[0]
+        self.num_class = int(
+            max(
+                getattr(dataset, "num_class", 0) for dataset in datasets
+            )
+        )
+        if self.num_class <= 0:
+            self.num_class = int(np.unique(self.y).size)
+        for attribute in ("max_seq_len", "feature_dim", "class_names"):
+            if hasattr(first, attribute):
+                setattr(self, attribute, getattr(first, attribute))
+
+
 class Exp_Stage1_Feature(Exp_Basic):
     METRIC_FIELDNAMES = [
         "epoch",
@@ -294,6 +329,7 @@ class Exp_Stage1_Feature(Exp_Basic):
 
     def __init__(self, args):
         self.loss_mode = getattr(args, "stage1_loss", "triplet").lower()
+        self.use_validation = bool(getattr(args, "use_validation", True))
         self.triplet_miner = None
         self.triplet_criterion = None
         self.classification_criterion = None
@@ -317,6 +353,10 @@ class Exp_Stage1_Feature(Exp_Basic):
             return dataset.num_class
         return len(np.unique(dataset.y))
 
+    def _merge_datasets(self, *datasets):
+        """Merge datasets for no-validation training while retaining metadata."""
+        return MergedStage1Dataset(*datasets)
+
     def _dataset_summary(self, dataset, split_name):
         seq_len = self._dataset_seq_len(dataset)
         feature_dim = self._dataset_feature_dim(dataset)
@@ -327,6 +367,14 @@ class Exp_Stage1_Feature(Exp_Basic):
         )
 
     def _dataset_summary_payload(self, dataset, split_name):
+        if dataset is None:
+            return {
+                "split": split_name,
+                "samples": 0,
+                "seq_len": None,
+                "feat_dim": None,
+                "num_class": 0,
+            }
         return {
             "split": split_name,
             "samples": len(dataset),
@@ -336,7 +384,13 @@ class Exp_Stage1_Feature(Exp_Basic):
         }
 
     def _checkpoint_dir(self, setting):
-        return Path("./checkpoints") / self.args.model / "stage1" / setting
+        result_root = getattr(self.args, "result_dir", None)
+        if result_root is None:
+            # Keep generated weights outside the source tree by default.
+            result_root = Path(__file__).resolve().parents[2] / "result"
+        else:
+            result_root = Path(result_root).expanduser()
+        return result_root / self.args.model / "stage1" / setting
 
     def _log_dir(self, setting):
         log_root = getattr(self.args, "log_dir", None)
@@ -364,6 +418,7 @@ class Exp_Stage1_Feature(Exp_Basic):
             "run_directory_name": setting,
             "full_setting_name": getattr(self.args, "full_setting_name", setting),
             "run_started_at": getattr(self.args, "run_started_at", None),
+            "validation_enabled": self.use_validation,
             "paths": {
                 "checkpoint_dir": str(checkpoint_dir),
                 "log_dir": str(log_dir),
@@ -383,6 +438,7 @@ class Exp_Stage1_Feature(Exp_Basic):
         summary_payload = {
             "setting": setting,
             "full_setting_name": getattr(self.args, "full_setting_name", setting),
+            "validation_enabled": self.use_validation,
             "args": vars(deepcopy(self.args)),
             "splits": {
                 "train": self._dataset_summary_payload(train_data, "TRAIN"),
@@ -633,15 +689,35 @@ class Exp_Stage1_Feature(Exp_Basic):
         return checkpoint
 
     def train(self, setting):
-        train_data, _ = self._get_data(flag="TRAIN")
-        train_loader = self._build_train_loader(train_data)
-        train_eval_loader = self._build_eval_loader(train_data)
-        vali_data, _ = self._get_data(flag="VAL")
-        vali_loader = self._build_eval_loader(vali_data)
+        raw_train_data, _ = self._get_data(flag="TRAIN")
+        raw_vali_data, _ = self._get_data(flag="VAL")
         test_data, _ = self._get_data(flag="TEST")
 
+        if self.use_validation:
+            train_data = raw_train_data
+            vali_data = raw_vali_data
+            selection_name = "Validation"
+            selection_split = "val"
+        else:
+            # Explicitly fold the original validation samples into training.
+            # The test split is then the only held-out split and is used for
+            # checkpoint selection as requested.
+            train_data = self._merge_datasets(raw_train_data, raw_vali_data)
+            vali_data = None
+            selection_name = "Test"
+            selection_split = "test"
+
+        train_loader = self._build_train_loader(train_data)
+        train_eval_loader = self._build_eval_loader(train_data)
+        selection_loader = self._build_eval_loader(
+            raw_vali_data if self.use_validation else test_data
+        )
+
         print(self._dataset_summary(train_data, "TRAIN"))
-        print(self._dataset_summary(vali_data, "VAL"))
+        if self.use_validation:
+            print(self._dataset_summary(raw_vali_data, "VAL"))
+        else:
+            print("VAL: disabled (original validation samples merged into TRAIN)")
         print(self._dataset_summary(test_data, "TEST"))
         self._prepare_metric_logging(setting, train_data, vali_data, test_data)
 
@@ -653,7 +729,7 @@ class Exp_Stage1_Feature(Exp_Basic):
         self._select_criterion()
         self._maybe_resume_from_checkpoint()
 
-        best_val_kmeans = -np.inf
+        best_selection_kmeans = -np.inf
         early_stop_counter = 0
 
         for epoch in range(self.args.train_epochs):
@@ -698,12 +774,12 @@ class Exp_Stage1_Feature(Exp_Basic):
                 train_eval_triplets,
             ) = self._evaluate_loader(train_eval_loader)
             (
-                val_loss,
-                val_cls_loss,
-                val_metric_loss,
-                val_kmeans,
-                val_triplets,
-            ) = self._evaluate_loader(vali_loader)
+                selection_loss,
+                selection_cls_loss,
+                selection_metric_loss,
+                selection_kmeans,
+                selection_triplets,
+            ) = self._evaluate_loader(selection_loader)
             current_lr = model_optim.param_groups[0]["lr"]
 
             self._append_metric_row(
@@ -720,12 +796,12 @@ class Exp_Stage1_Feature(Exp_Basic):
             )
             self._append_metric_row(
                 epoch=epoch + 1,
-                split="val",
-                loss=val_loss,
-                classification_loss=val_cls_loss,
-                metric_loss=val_metric_loss,
-                kmeans_score=val_kmeans,
-                mined_triplets=val_triplets,
+                split=selection_split,
+                loss=selection_loss,
+                classification_loss=selection_cls_loss,
+                metric_loss=selection_metric_loss,
+                kmeans_score=selection_kmeans,
+                mined_triplets=selection_triplets,
                 learning_rate=current_lr,
                 epoch_time=epoch_time_cost,
                 steps=train_steps,
@@ -738,29 +814,31 @@ class Exp_Stage1_Feature(Exp_Basic):
                 f"Train feature results --- Loss: {train_eval_loss:.5f}, Cls: {train_eval_cls_loss:.5f}, "
                 f"Metric: {train_eval_metric_loss:.5f}, KMeans: {train_kmeans:.5f}, "
                 f"MinedTriplets(step/eval): {train_step_triplets}/{train_eval_triplets}\n"
-                f"Validation feature results --- Loss: {val_loss:.5f}, Cls: {val_cls_loss:.5f}, "
-                f"Metric: {val_metric_loss:.5f}, KMeans: {val_kmeans:.5f}, "
-                f"MinedTriplets: {val_triplets}"
+                f"{selection_name} feature results --- Loss: {selection_loss:.5f}, "
+                f"Cls: {selection_cls_loss:.5f}, Metric: {selection_metric_loss:.5f}, "
+                f"KMeans: {selection_kmeans:.5f}, MinedTriplets: {selection_triplets}"
             )
 
-            if val_kmeans > best_val_kmeans + 1e-6:
-                best_val_kmeans = val_kmeans
+            if selection_kmeans > best_selection_kmeans + 1e-6:
+                best_selection_kmeans = selection_kmeans
                 early_stop_counter = 0
                 stage1_model = unwrap_model(self.model)
                 checkpoint_payload = build_checkpoint_payload(
                     self.model,
                     optimizer=model_optim,
                     epoch=epoch,
-                    best_metric=best_val_kmeans,
+                    best_metric=best_selection_kmeans,
                     args_dict=vars(deepcopy(self.args)),
                     extra={
                         "stage": "stage1_feature_training",
+                        "selection_split": selection_split,
                         "backbone_state_dict": stage1_model.backbone.state_dict(),
                     },
                 )
                 torch.save(checkpoint_payload, checkpoint_dir / "checkpoint.pth")
                 print(
-                    f"Validation KMeans improved to {best_val_kmeans:.5f}. Saving best feature checkpoint ..."
+                    f"{selection_name} KMeans improved to {best_selection_kmeans:.5f}. "
+                    "Saving best feature checkpoint ..."
                 )
             else:
                 early_stop_counter += 1
@@ -779,8 +857,6 @@ class Exp_Stage1_Feature(Exp_Basic):
         return self.model
 
     def test(self, setting, test=0):
-        vali_data, _ = self._get_data(flag="VAL")
-        vali_loader = self._build_eval_loader(vali_data)
         test_data, _ = self._get_data(flag="TEST")
         test_loader = self._build_eval_loader(test_data)
         checkpoint_dir = self._checkpoint_dir(setting)
@@ -791,13 +867,6 @@ class Exp_Stage1_Feature(Exp_Basic):
 
         self._select_criterion()
         (
-            val_loss,
-            val_cls_loss,
-            val_metric_loss,
-            val_kmeans,
-            val_triplets,
-        ) = self._evaluate_loader(vali_loader)
-        (
             test_loss,
             test_cls_loss,
             test_metric_loss,
@@ -805,15 +874,28 @@ class Exp_Stage1_Feature(Exp_Basic):
             test_triplets,
         ) = self._evaluate_loader(test_loader)
 
-        self._append_metric_row(
-            epoch="final",
-            split="val_final",
-            loss=val_loss,
-            classification_loss=val_cls_loss,
-            metric_loss=val_metric_loss,
-            kmeans_score=val_kmeans,
-            mined_triplets=val_triplets,
-        )
+        if self.use_validation:
+            vali_data, _ = self._get_data(flag="VAL")
+            vali_loader = self._build_eval_loader(vali_data)
+            (
+                val_loss,
+                val_cls_loss,
+                val_metric_loss,
+                val_kmeans,
+                val_triplets,
+            ) = self._evaluate_loader(vali_loader)
+            self._append_metric_row(
+                epoch="final",
+                split="val_final",
+                loss=val_loss,
+                classification_loss=val_cls_loss,
+                metric_loss=val_metric_loss,
+                kmeans_score=val_kmeans,
+                mined_triplets=val_triplets,
+            )
+        else:
+            val_loss = val_cls_loss = val_metric_loss = val_kmeans = val_triplets = None
+
         self._append_metric_row(
             epoch="final",
             split="test_final",
@@ -824,17 +906,27 @@ class Exp_Stage1_Feature(Exp_Basic):
             mined_triplets=test_triplets,
         )
 
-        print(
-            f"Final validation feature results --- Loss: {val_loss:.5f}, Cls: {val_cls_loss:.5f}, "
-            f"Metric: {val_metric_loss:.5f}, KMeans: {val_kmeans:.5f}, MinedTriplets: {val_triplets}\n"
-            f"Final test feature results --- Loss: {test_loss:.5f}, Cls: {test_cls_loss:.5f}, "
-            f"Metric: {test_metric_loss:.5f}, KMeans: {test_kmeans:.5f}, MinedTriplets: {test_triplets}"
-        )
+        if self.use_validation:
+            print(
+                f"Final validation feature results --- Loss: {val_loss:.5f}, Cls: {val_cls_loss:.5f}, "
+                f"Metric: {val_metric_loss:.5f}, KMeans: {val_kmeans:.5f}, MinedTriplets: {val_triplets}\n"
+                f"Final test feature results --- Loss: {test_loss:.5f}, Cls: {test_cls_loss:.5f}, "
+                f"Metric: {test_metric_loss:.5f}, KMeans: {test_kmeans:.5f}, MinedTriplets: {test_triplets}"
+            )
+        else:
+            print(
+                f"Final test feature results (validation disabled) --- Loss: {test_loss:.5f}, "
+                f"Cls: {test_cls_loss:.5f}, Metric: {test_metric_loss:.5f}, "
+                f"KMeans: {test_kmeans:.5f}, MinedTriplets: {test_triplets}"
+            )
 
         if not getattr(self.args, "keep_checkpoint", True):
             self.del_weight(str(checkpoint_dir))
 
-        return {"ValKMeans": val_kmeans, "TestKMeans": test_kmeans}
+        return {
+            "ValKMeans": np.nan if val_kmeans is None else val_kmeans,
+            "TestKMeans": test_kmeans,
+        }
 
     def del_weight(self, path):
         checkpoint_path = os.path.join(path, "checkpoint.pth")

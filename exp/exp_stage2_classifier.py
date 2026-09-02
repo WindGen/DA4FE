@@ -78,7 +78,12 @@ class Exp_Stage2_Classifier(Exp_Basic):
         )
 
     def _checkpoint_dir(self, setting):
-        return Path("./checkpoints") / self.args.model / "stage2" / setting
+        result_root = getattr(self.args, "result_dir", None)
+        if result_root is None:
+            result_root = Path(__file__).resolve().parents[2] / "result"
+        else:
+            result_root = Path(result_root).expanduser()
+        return result_root / self.args.model / "stage2" / setting
 
     def _log_dir(self, setting):
         log_root = getattr(self.args, "log_dir", None)

@@ -6,6 +6,7 @@ import random
 import numpy as np
 import os
 import psutil
+from pathlib import Path
 
 
 def str2bool(value):
@@ -171,8 +172,14 @@ if __name__ == "__main__":
         default=None,
         help=(
             "root directory for training metric logs; use None to save logs "
-            "inside the corresponding checkpoints/<model>/<setting> folder"
+            "inside the corresponding result/<model>/<setting> folder"
         ),
+    )
+    parser.add_argument(
+        "--result_dir",
+        type=str_or_none,
+        default=None,
+        help="root directory for model outputs; default is ../result next to the source tree",
     )
     parser.add_argument("--itr", type=int, default=1, help="experiments times")
     parser.add_argument("--train_epochs", type=int, default=500, help="train epochs")
@@ -209,6 +216,8 @@ if __name__ == "__main__":
     # parser.add_argument('--devices', type=str, default='0,1', help='device ids of multiple gpus')
 
     args = parser.parse_args()
+    if args.result_dir is None:
+        args.result_dir = str(Path(__file__).resolve().parent.parent / "result")
     args.requested_seq_len = args.seq_len
     args.use_gpu = True if torch.cuda.is_available() and args.use_gpu else False
 

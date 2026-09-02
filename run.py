@@ -95,7 +95,12 @@ def build_full_setting(args):
 def build_run_directory_name(args):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     candidate = timestamp
-    roots = [Path("./checkpoints") / args.model]
+    result_root = getattr(args, "result_dir", None)
+    if result_root is None:
+        result_root = Path(__file__).resolve().parent.parent / "result"
+    else:
+        result_root = Path(result_root).expanduser()
+    roots = [result_root / args.model]
     if args.log_dir is not None:
         roots.append(Path(args.log_dir) / args.data)
 
@@ -224,7 +229,7 @@ if __name__ == "__main__":
         default=None,
         help=(
             "root directory for training metric logs; use None to save logs "
-            "inside the corresponding checkpoints/<model>/<setting> folder"
+            "inside the corresponding result/<model>/<setting> folder"
         ),
     )
 
@@ -269,6 +274,12 @@ if __name__ == "__main__":
             "when --loss ce_triplet, choose whether to enable triplet from the start "
             "or activate it after a monitored metric reaches a threshold"
         ),
+    )
+    parser.add_argument(
+        "--result_dir",
+        type=str_or_none,
+        default=None,
+        help="root directory for model outputs; default is ../result next to the source tree",
     )
     parser.add_argument(
         "--triplet_start_metric",
@@ -344,6 +355,8 @@ if __name__ == "__main__":
     # parser.add_argument('--devices', type=str, default='0,1', help='device ids of multiple gpus')
 
     args = parser.parse_args()
+    if args.result_dir is None:
+        args.result_dir = str(Path(__file__).resolve().parent.parent / "result")
     args.requested_seq_len = args.seq_len
     args.use_gpu = True if torch.cuda.is_available() and args.use_gpu else False
 

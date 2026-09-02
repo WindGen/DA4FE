@@ -42,7 +42,12 @@ def build_stage2_full_setting(args):
 def build_run_directory_name(args, stage_name):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     candidate = timestamp
-    roots = [Path("./checkpoints") / args.model / stage_name]
+    result_root = getattr(args, "result_dir", None)
+    if result_root is None:
+        result_root = Path(__file__).resolve().parent.parent / "result"
+    else:
+        result_root = Path(result_root).expanduser()
+    roots = [result_root / args.model / stage_name]
     if args.log_dir is not None:
         roots.append(Path(args.log_dir) / args.data / stage_name)
 
@@ -105,6 +110,12 @@ if __name__ == "__main__":
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--log_dir", type=str_or_none, default=None)
+    parser.add_argument(
+        "--result_dir",
+        type=str_or_none,
+        default=None,
+        help="root directory for model outputs; default is ../result next to the source tree",
+    )
     parser.add_argument("--resume_ckpt", type=str_or_none, required=True, help="stage1 checkpoint path")
 
     parser.add_argument(
@@ -133,6 +144,8 @@ if __name__ == "__main__":
     parser.add_argument("--devices", type=str, default="0,1,2,3")
 
     args = parser.parse_args()
+    if args.result_dir is None:
+        args.result_dir = str(Path(__file__).resolve().parent.parent / "result")
     args.requested_seq_len = args.seq_len
     args.use_gpu = True if torch.cuda.is_available() and args.use_gpu else False
 
