@@ -50,6 +50,11 @@ def build_stage1_full_setting(args):
             f"_td_{args.da4fe_temporal_dim}_fd_{args.da4fe_frequency_dim}"
             f"_fod_{args.da4fe_fusion_out_dim}"
         )
+        setting += (
+            f"_fs_{args.sampling_rate}"
+            f"_fwin_{args.frequency_window}"
+            f"_fnorm_{args.frequency_normalization}"
+        )
     if args.eeg_adaptive_seq_len and args.requested_seq_len > 0:
         setting += f"_sl_{args.requested_seq_len}"
     return setting
@@ -100,18 +105,44 @@ if __name__ == "__main__":
     parser.add_argument("--eeg_hf_cache_dir", type=str_or_none, default=None)
 
     parser.add_argument("--seq_len", type=int, default=512, help="input sequence length")
+    parser.add_argument(
+        "--sampling_rate",
+        type=float,
+        default=None,
+        help=(
+            "EEG sampling rate in Hz; required when the DA4FE "
+            "frequency branch is enabled"
+        ),
+    )
+    parser.add_argument(
+        "--frequency_window",
+        type=str,
+        default="hann",
+        choices=["hann", "rectangular"],
+        help="window used before rFFT in the DA4FE frequency branch",
+    )
+    parser.add_argument(
+        "--frequency_normalization",
+        type=str,
+        default="relative",
+        choices=["relative", "physical"],
+        help=(
+            "frequency normalization: relative power (recommended) "
+            "or physical PSD"
+        ),
+    )
     parser.add_argument("--patch_len", type=int, default=4, help="cross-channel patch length")
     parser.add_argument("--enc_in", type=int, default=128, help="encoder input size")
     parser.add_argument("--d_model", type=int, default=256, help="model dimension")
-    parser.add_argument("--n_heads", type=int, default=4, help="number of heads")
-    parser.add_argument("--t_layer", type=int, default=2, help="temporal encoder layers")
-    parser.add_argument("--v_layer", type=int, default=2, help="channel encoder layers")
-    parser.add_argument("--f_layer", type=int, default=2, help="frequency encoder layers")
-    parser.add_argument("--da4fe_channel_dim", type=int, default=128)
-    parser.add_argument("--da4fe_temporal_dim", type=int, default=128)
-    parser.add_argument("--da4fe_frequency_dim", type=int, default=128)
+    parser.add_argument("--n_heads", type=int, default=6, help="number of heads")
+    parser.add_argument("--t_layer", type=int, default=4, help="temporal encoder layers")
+    parser.add_argument("--v_layer", type=int, default=4, help="channel encoder layers")
+    parser.add_argument("--f_layer", type=int, default=4, help="frequency encoder layers")
+    parser.add_argument("--da4fe_channel_dim", type=int, default=64)
+    parser.add_argument("--da4fe_temporal_dim", type=int, default=64)
+    parser.add_argument("--da4fe_frequency_dim", type=int, default=64)
     parser.add_argument("--da4fe_fusion_mode", type=str, default="concat_mlp", choices=["add", "concat_mlp"])
-    parser.add_argument("--da4fe_fusion_hidden_dim", type=int, default=256)
+    parser.add_argument("--da4fe_fusion_hidden_dim", type=int, default=512)
     parser.add_argument("--da4fe_fusion_out_dim", type=int, default=256)
     parser.add_argument("--da4fe_channel_weight", type=float, default=1.0)
     parser.add_argument("--da4fe_temporal_weight", type=float, default=1.0)
@@ -133,7 +164,7 @@ if __name__ == "__main__":
     parser.add_argument("--train_epochs", type=int, default=500)
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--patience", type=int, default=16)
-    parser.add_argument("--learning_rate", type=float, default=1e-4)
+    parser.add_argument("--learning_rate", type=float, default=5e-5)
 
     parser.add_argument(
         "--stage1_loss",
@@ -160,13 +191,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--stage1_triplet_margin",
         type=float,
-        default=0.2,
+        default=0.8,
         help="margin used by stage1 triplet loss",
     )
     parser.add_argument(
         "--stage1_ce_weight",
         type=float,
-        default=1.0,
+        default=0.5,
         help="weight of cross-entropy style loss when stage1 loss includes classification supervision",
     )
     parser.add_argument(
@@ -178,7 +209,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--stage1_label_smoothing",
         type=float,
-        default=0.0,
+        default=0.05,
         help="label smoothing used by CE, ArcFace, and CosFace losses",
     )
     parser.add_argument(
@@ -214,7 +245,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--stage1_samples_per_class",
         type=int,
-        default=2,
+        default=16,
         help="number of samples per class inside each stage1 batch when triplet loss is used",
     )
     parser.add_argument("--resume_ckpt", type=str_or_none, default=None)
@@ -247,6 +278,18 @@ if __name__ == "__main__":
     parser.add_argument("--devices", type=str, default="0,1,2,3")
 
     args = parser.parse_args()
+    effective_f_layer = (
+        args.f_layer if args.f_layer is not None else args.t_layer
+    )
+    if (
+        args.model == "DA4FE"
+        and effective_f_layer > 0
+        and (args.sampling_rate is None or args.sampling_rate <= 0)
+    ):
+        parser.error(
+            "--sampling_rate must be a positive value when "
+            "DA4FE frequency branch is enabled"
+        )
     if args.result_dir is None:
         args.result_dir = str(Path(__file__).resolve().parent.parent / "result")
     args.requested_seq_len = args.seq_len

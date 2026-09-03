@@ -36,6 +36,12 @@ def build_stage2_full_setting(args):
         f"{args.model}_{args.data}_seed_{args.seed}_stage2_heads_{args.stage2_classifier_heads}"
         f"_std_{int(args.stage2_standardize_features)}_bs_{args.batch_size}"
     )
+    if args.model == "DA4FE":
+        setting += (
+            f"_fs_{args.sampling_rate}"
+            f"_fwin_{args.frequency_window}"
+            f"_fnorm_{args.frequency_normalization}"
+        )
     return setting
 
 
@@ -84,6 +90,32 @@ if __name__ == "__main__":
     parser.add_argument("--eeg_hf_cache_dir", type=str_or_none, default=None)
 
     parser.add_argument("--seq_len", type=int, default=512, help="input sequence length")
+    parser.add_argument(
+        "--sampling_rate",
+        type=float,
+        default=None,
+        help=(
+            "EEG sampling rate in Hz; required when the DA4FE "
+            "frequency branch is enabled"
+        ),
+    )
+    parser.add_argument(
+        "--frequency_window",
+        type=str,
+        default="hann",
+        choices=["hann", "rectangular"],
+        help="window used before rFFT in the DA4FE frequency branch",
+    )
+    parser.add_argument(
+        "--frequency_normalization",
+        type=str,
+        default="relative",
+        choices=["relative", "physical"],
+        help=(
+            "frequency normalization: relative power (recommended) "
+            "or physical PSD"
+        ),
+    )
     parser.add_argument("--patch_len", type=int, default=4, help="cross-channel patch length")
     parser.add_argument("--enc_in", type=int, default=128, help="encoder input size")
     parser.add_argument("--d_model", type=int, default=256, help="model dimension")
@@ -144,6 +176,18 @@ if __name__ == "__main__":
     parser.add_argument("--devices", type=str, default="0,1,2,3")
 
     args = parser.parse_args()
+    effective_f_layer = (
+        args.f_layer if args.f_layer is not None else args.t_layer
+    )
+    if (
+        args.model == "DA4FE"
+        and effective_f_layer > 0
+        and (args.sampling_rate is None or args.sampling_rate <= 0)
+    ):
+        parser.error(
+            "--sampling_rate must be a positive value when "
+            "DA4FE frequency branch is enabled"
+        )
     if args.result_dir is None:
         args.result_dir = str(Path(__file__).resolve().parent.parent / "result")
     args.requested_seq_len = args.seq_len

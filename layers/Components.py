@@ -19,9 +19,9 @@ class Aug_Channel_Embedding(nn.Module):
         self.pos_emb = PositionalEmbedding(d_model=configs.seq_len)
 
     def forward(self, x):  # (batch_size, seq_len, enc_in)
-        x = x.transpose(1, 2)  # (batch_size, enc_in, seq_len)
+        x = x.transpose(1, 2).contiguous()  # (batch_size, enc_in, seq_len)
         aug_idx = random.randint(0, len(self.augmentation) - 1)
-        x_aug = self.augmentation[aug_idx](x)
+        x_aug = self.augmentation[aug_idx](x.clone())
         x_aug = x_aug + self.pos_emb(x_aug)
         return self.Channel_Embedding(x_aug)
 
@@ -42,20 +42,69 @@ class Aug_Temporal_Embedding(nn.Module):
         self.pos_emb = PositionalEmbedding(d_model=configs.seq_len)
 
     def forward(self, x):  # (batch_size, seq_len, enc_in)
-        x = x.transpose(1, 2)  # (batch_size, enc_in, seq_len)
+        x = x.transpose(1, 2).contiguous()  # (batch_size, enc_in, seq_len)
         aug_idx = random.randint(0, len(self.augmentation) - 1)
-        x_aug = self.augmentation[aug_idx](x)
+        x_aug = self.augmentation[aug_idx](x.clone())
         x_aug = x_aug + self.pos_emb(x_aug)
         if self.patch_len == 1:
             x_aug = x_aug.transpose(1, 2)
         return self.Temporal_Embedding(x_aug)
 
 
+class PhysicalFrequencyEmbedding(nn.Module):
+    """Encode a token's physical frequency instead of its bin index."""
+
+    def __init__(self, d_model):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(2, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model),
+        )
+
+    def forward(self, freqs, nyquist):
+        # Use both linear and logarithmic coordinates. The latter gives the
+        # low-frequency EEG bands more resolution.
+        normalized_freq = freqs / nyquist
+        log_normalized_freq = torch.log1p(freqs) / math.log1p(nyquist)
+        coordinates = torch.stack(
+            [normalized_freq, log_normalized_freq],
+            dim=-1,
+        )
+        return self.encoder(coordinates)
+
+
 class Aug_Frequency_Embedding(nn.Module):
     def __init__(self, configs):
         super().__init__()
         self.patch_len = configs.patch_len
-        self.freq_seq_len = configs.seq_len // 2 + 1
+        self.seq_len = configs.seq_len
+        self.eps = 1e-8
+        self.sampling_rate = getattr(configs, "sampling_rate", None)
+        self.frequency_normalization = getattr(
+            configs,
+            "frequency_normalization",
+            "relative",
+        )
+        self.frequency_window = getattr(
+            configs,
+            "frequency_window",
+            "hann",
+        )
+
+        if self.sampling_rate is None or self.sampling_rate <= 0:
+            raise ValueError(
+                "DA4FE frequency branch requires a positive sampling_rate"
+            )
+        if self.frequency_normalization not in {"relative", "physical"}:
+            raise ValueError(
+                "frequency_normalization must be 'relative' or 'physical'"
+            )
+        if self.frequency_window not in {"hann", "rectangular"}:
+            raise ValueError(
+                "frequency_window must be 'hann' or 'rectangular'"
+            )
+
         aug_idxs = configs.augmentations.split(",")
         self.augmentation = nn.ModuleList(
             [get_augmentation(aug) for aug in aug_idxs]
@@ -65,20 +114,117 @@ class Aug_Frequency_Embedding(nn.Module):
             if self.patch_len > 1
             else nn.Linear(configs.enc_in, configs.d_model)
         )
-        self.pos_emb = PositionalEmbedding(d_model=self.freq_seq_len)
+
+        if self.frequency_window == "hann":
+            window = torch.hann_window(
+                self.seq_len,
+                periodic=True,
+            )
+        else:
+            window = torch.ones(self.seq_len)
+        self.register_buffer("window", window, persistent=False)
+
+        self.freq_coord_embedding = PhysicalFrequencyEmbedding(
+            configs.d_model
+        )
+
+    def _compute_log_psd(self, x):
+        """
+        Compute a normalized one-sided log power spectrum.
+
+        Args:
+            x: [B, C, T], with a fixed T equal to configs.seq_len.
+        Returns:
+            log_psd: [B, C, F]
+            freqs: [F], physical frequencies in Hz
+        """
+        time_len = x.size(-1)
+        if time_len != self.seq_len:
+            raise ValueError(
+                f"Expected frequency input length {self.seq_len}, "
+                f"got {time_len}. Use fixed-length/resampled inputs "
+                "or implement length-aware spectral processing."
+            )
+
+        # Remove each channel's DC component before spectral analysis.
+        x = x - x.mean(dim=-1, keepdim=True)
+
+        window = self.window.to(device=x.device, dtype=x.dtype)
+        x_windowed = x * window.view(1, 1, -1)
+
+        spectrum = torch.fft.rfft(x_windowed, dim=-1)
+        power = spectrum.abs().pow(2)
+
+        # Periodogram normalization. This makes the result comparable across
+        # windows and gives it the interpretation of power per Hz.
+        window_energy = window.pow(2).sum()
+        psd = power / (
+            self.sampling_rate * window_energy + self.eps
+        )
+
+        # Correct the one-sided spectrum, excluding DC and Nyquist bins.
+        one_sided_correction = torch.ones_like(psd)
+        if time_len % 2 == 0:
+            one_sided_correction[..., 1:-1] = 2.0
+        else:
+            one_sided_correction[..., 1:] = 2.0
+        psd = psd * one_sided_correction
+
+        if self.frequency_normalization == "relative":
+            psd = psd / (
+                psd.sum(dim=-1, keepdim=True) + self.eps
+            )
+
+        log_psd = torch.log(psd + self.eps)
+
+        freqs = torch.fft.rfftfreq(
+            n=time_len,
+            d=1.0 / self.sampling_rate,
+            device=x.device,
+        )
+        return log_psd, freqs
+
+    def _token_frequencies(self, freqs, token_count):
+        """Return the physical center frequency of each spectral token."""
+        if self.patch_len == 1:
+            return freqs
+
+        centers = (
+            torch.arange(
+                token_count,
+                device=freqs.device,
+                dtype=freqs.dtype,
+            )
+            * self.patch_len
+            + (self.patch_len - 1) / 2.0
+        )
+        centers = centers.round().long().clamp(
+            min=0,
+            max=freqs.numel() - 1,
+        )
+        return freqs[centers]
 
     def forward(self, x):  # (batch_size, seq_len, enc_in)
-        x = x.transpose(1, 2)  # (batch_size, enc_in, seq_len)
+        x = x.transpose(1, 2).contiguous()  # (batch_size, enc_in, seq_len)
         aug_idx = random.randint(0, len(self.augmentation) - 1)
-        x_aug = self.augmentation[aug_idx](x)
-        
-        x_fft = torch.fft.rfft(x_aug, dim=-1)
-        x_freq = torch.log1p(torch.abs(x_fft).pow(2))
+        # Some augmentations are in-place; clone keeps branches independent.
+        x_aug = self.augmentation[aug_idx](x.clone())
 
-        x_freq = x_freq + self.pos_emb(x_freq)
+        x_freq, freqs = self._compute_log_psd(x_aug)
+
         if self.patch_len == 1:
             x_freq = x_freq.transpose(1, 2)
-        return self.Frequency_Embedding(x_freq)
+
+        tokens = self.Frequency_Embedding(x_freq)
+        token_freqs = self._token_frequencies(
+            freqs,
+            tokens.size(1),
+        )
+        freq_pos = self.freq_coord_embedding(
+            token_freqs,
+            nyquist=self.sampling_rate / 2.0,
+        )
+        return tokens + freq_pos.unsqueeze(0)
 
 
 class BranchFusion(nn.Module):
