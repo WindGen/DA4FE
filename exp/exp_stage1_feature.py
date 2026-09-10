@@ -13,6 +13,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import optim
 from torch.utils.data import BatchSampler, ConcatDataset, DataLoader
+from tqdm.auto import tqdm
 
 from data_provider.data_factory import data_provider
 from data_provider.uea import collate_fn
@@ -636,7 +637,7 @@ class Exp_Stage1_Feature(Exp_Basic):
             mined_triplets,
         )
 
-    def _evaluate_loader(self, data_loader):
+    def _evaluate_loader(self, data_loader, desc=None):
         total_loss = []
         classification_losses = []
         metric_losses = []
@@ -646,7 +647,18 @@ class Exp_Stage1_Feature(Exp_Basic):
 
         self.model.eval()
         with torch.no_grad():
-            for batch_x, label, padding_mask in data_loader:
+            iterator = (
+                tqdm(
+                    data_loader,
+                    desc=desc,
+                    unit="batch",
+                    leave=False,
+                    dynamic_ncols=True,
+                )
+                if desc
+                else data_loader
+            )
+            for batch_x, label, padding_mask in iterator:
                 batch_x = batch_x.float().to(self.device)
                 label = label.to(self.device)
                 logits, fused_features, embeddings = self._extract_features(batch_x)
@@ -659,6 +671,11 @@ class Exp_Stage1_Feature(Exp_Basic):
                 mined_triplets += batch_triplets
                 feature_rows.append(embeddings.cpu().numpy())
                 label_rows.append(label.detach().cpu().numpy())
+                if desc:
+                    iterator.set_postfix(
+                        loss=f"{loss.item():.4f}",
+                        refresh=False,
+                    )
 
         total_loss = float(np.average(total_loss))
         classification_loss = float(np.average(classification_losses))
@@ -732,7 +749,13 @@ class Exp_Stage1_Feature(Exp_Basic):
         best_selection_kmeans = -np.inf
         early_stop_counter = 0
 
-        for epoch in range(self.args.train_epochs):
+        epoch_iterator = tqdm(
+            range(self.args.train_epochs),
+            desc="Stage-1 training",
+            unit="epoch",
+            dynamic_ncols=True,
+        )
+        for epoch in epoch_iterator:
             step_total_losses = []
             step_classification_losses = []
             step_metric_losses = []
@@ -740,7 +763,14 @@ class Exp_Stage1_Feature(Exp_Basic):
 
             self.model.train()
             epoch_time = time.time()
-            for batch_x, label, padding_mask in train_loader:
+            batch_iterator = tqdm(
+                train_loader,
+                desc=f"Epoch {epoch + 1}/{self.args.train_epochs}",
+                unit="batch",
+                leave=False,
+                dynamic_ncols=True,
+            )
+            for batch_x, label, padding_mask in batch_iterator:
                 model_optim.zero_grad()
 
                 batch_x = batch_x.float().to(self.device)
@@ -758,9 +788,15 @@ class Exp_Stage1_Feature(Exp_Basic):
                 loss.backward()
                 nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=4.0)
                 model_optim.step()
+                batch_iterator.set_postfix(
+                    loss=f"{loss.item():.4f}",
+                    refresh=False,
+                )
 
             epoch_time_cost = time.time() - epoch_time
-            print(f"Epoch: {epoch + 1} cost time: {epoch_time_cost}")
+            tqdm.write(
+                f"Epoch: {epoch + 1} cost time: {epoch_time_cost}"
+            )
             train_step_loss = float(np.average(step_total_losses))
             train_step_cls_loss = float(np.average(step_classification_losses))
             train_step_metric_loss = float(np.average(step_metric_losses))
@@ -772,14 +808,20 @@ class Exp_Stage1_Feature(Exp_Basic):
                 train_eval_metric_loss,
                 train_kmeans,
                 train_eval_triplets,
-            ) = self._evaluate_loader(train_eval_loader)
+            ) = self._evaluate_loader(
+                train_eval_loader,
+                desc=f"Epoch {epoch + 1} train eval",
+            )
             (
                 selection_loss,
                 selection_cls_loss,
                 selection_metric_loss,
                 selection_kmeans,
                 selection_triplets,
-            ) = self._evaluate_loader(selection_loader)
+            ) = self._evaluate_loader(
+                selection_loader,
+                desc=f"Epoch {epoch + 1} {selection_name.lower()} eval",
+            )
             current_lr = model_optim.param_groups[0]["lr"]
 
             self._append_metric_row(
@@ -807,7 +849,7 @@ class Exp_Stage1_Feature(Exp_Basic):
                 steps=train_steps,
             )
 
-            print(
+            tqdm.write(
                 f"Epoch: {epoch + 1}, Steps: {train_steps}, | "
                 f"Train Step Loss: {train_step_loss:.5f}, "
                 f"Cls: {train_step_cls_loss:.5f}, Metric: {train_step_metric_loss:.5f}\n"
@@ -817,6 +859,11 @@ class Exp_Stage1_Feature(Exp_Basic):
                 f"{selection_name} feature results --- Loss: {selection_loss:.5f}, "
                 f"Cls: {selection_cls_loss:.5f}, Metric: {selection_metric_loss:.5f}, "
                 f"KMeans: {selection_kmeans:.5f}, MinedTriplets: {selection_triplets}"
+            )
+            epoch_iterator.set_postfix(
+                train_loss=f"{train_eval_loss:.4f}",
+                selection_kmeans=f"{selection_kmeans:.4f}",
+                refresh=False,
             )
 
             if selection_kmeans > best_selection_kmeans + 1e-6:
@@ -836,7 +883,7 @@ class Exp_Stage1_Feature(Exp_Basic):
                     },
                 )
                 torch.save(checkpoint_payload, checkpoint_dir / "checkpoint.pth")
-                print(
+                tqdm.write(
                     f"{selection_name} KMeans improved to {best_selection_kmeans:.5f}. "
                     "Saving best feature checkpoint ..."
                 )

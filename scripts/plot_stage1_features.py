@@ -13,7 +13,10 @@ Example (local EEG-ImageNet):
         --method tsne
 
 The script writes all normalized embeddings to ``features.npz`` and creates
-one comparable three-panel plot plus one plot for each split.
+one comparable plot plus one plot for each available split.  Runs trained with
+``use_validation=false`` produce only train and test panels; the original
+training and validation samples are merged into the train panel to match the
+training procedure.
 """
 
 from __future__ import annotations
@@ -57,6 +60,12 @@ DEFAULT_ARGS: dict[str, Any] = {
     "data_path": "EEG-ImageNet",
     "eeg_hf_dataset_id": "luigi-s/EEG_Image_CVPR_ALL_subj",
     "eeg_hf_cache_dir": None,
+    # DA4FE's frequency branch requires these fields.  They are overwritten
+    # by run_params.json/checkpoint args for newer runs, and provide a safe
+    # fallback for older checkpoints whose metadata did not record them.
+    "sampling_rate": 1000.0,
+    "frequency_window": "hann",
+    "frequency_normalization": "relative",
     "seq_len": 512,
     "requested_seq_len": 512,
     "patch_len": 4,
@@ -106,6 +115,21 @@ DEFAULT_ARGS: dict[str, Any] = {
     "device_ids": [0],
     "use_amp": False,
 }
+
+
+def parse_bool(value: Any, default: bool = True) -> bool:
+    """Parse JSON/CLI-style booleans without treating ``"false"`` as true."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "y", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "n", "off"}:
+            return False
+    return bool(value)
 
 
 def parse_args() -> argparse.Namespace:
@@ -168,6 +192,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eeg-hf-dataset-id", dest="eeg_hf_dataset_id", default=None)
     parser.add_argument("--eeg-hf-cache-dir", dest="eeg_hf_cache_dir", default=None)
     parser.add_argument("--seq-len", "--seq_len", dest="seq_len", type=int, default=None)
+    parser.add_argument(
+        "--sampling-rate",
+        "--sampling_rate",
+        dest="sampling_rate",
+        type=float,
+        default=None,
+        help="EEG sampling rate in Hz; overrides metadata when supplied",
+    )
     parser.add_argument("--batch-size", "--batch_size", dest="batch_size", type=int, default=None)
     parser.add_argument("--num-workers", "--num_workers", dest="num_workers", type=int, default=None)
     parser.add_argument("--seed", type=int, default=None)
@@ -214,10 +246,15 @@ def resolve_checkpoint(path: Path) -> Path:
 
 def read_json_args(path: Path) -> dict[str, Any]:
     payload = json.loads(path.read_text(encoding="utf-8"))
-    if isinstance(payload, dict) and isinstance(payload.get("args"), dict):
-        return dict(payload["args"])
     if not isinstance(payload, dict):
         raise ValueError(f"Expected a JSON object in {path}")
+    if isinstance(payload.get("args"), dict):
+        values = dict(payload["args"])
+        # Newer runs record this at the metadata top level as well as in
+        # args.  Preserve it for checkpoints that omitted the args field.
+        if "validation_enabled" in payload:
+            values["use_validation"] = payload["validation_enabled"]
+        return values
     return dict(payload)
 
 
@@ -288,6 +325,7 @@ def build_runtime_args(
         "eeg_hf_dataset_id": cli.eeg_hf_dataset_id,
         "eeg_hf_cache_dir": cli.eeg_hf_cache_dir,
         "seq_len": cli.seq_len,
+        "sampling_rate": cli.sampling_rate,
         "batch_size": cli.batch_size,
         "num_workers": cli.num_workers,
         "seed": cli.seed,
@@ -298,6 +336,60 @@ def build_runtime_args(
 
     if values.get("requested_seq_len") in (None, 0):
         values["requested_seq_len"] = values.get("seq_len", 512)
+
+    # Older run metadata may contain ``sampling_rate: null`` (or omit it),
+    # while DA4FE's frequency branch rejects a non-positive value during model
+    # construction.  The training entry point uses 1000 Hz by default, so
+    # restore that value only when it is needed and invalid/missing.
+    if str(values.get("model", "")).upper() == "DA4FE":
+        try:
+            sampling_rate = float(values.get("sampling_rate"))
+        except (TypeError, ValueError):
+            sampling_rate = 0.0
+        raw_f_layer = values.get("f_layer")
+        if raw_f_layer is None:
+            # DA4FE falls back to t_layer when f_layer is omitted/None.
+            raw_f_layer = values.get("t_layer", 0)
+        try:
+            frequency_branch_enabled = int(raw_f_layer or 0) > 0
+        except (TypeError, ValueError):
+            frequency_branch_enabled = False
+        if frequency_branch_enabled and (
+            not np.isfinite(sampling_rate) or sampling_rate <= 0
+        ):
+            values["sampling_rate"] = 1000.0
+            print(
+                "Warning: sampling_rate is missing or non-positive in the saved "
+                "metadata; using the training default 1000 Hz."
+            )
+        else:
+            values["sampling_rate"] = sampling_rate
+
+        if frequency_branch_enabled:
+            frequency_window = str(values.get("frequency_window", "")).lower()
+            if frequency_window not in {"hann", "rectangular"}:
+                values["frequency_window"] = "hann"
+                print(
+                    "Warning: frequency_window is missing or invalid in the saved "
+                    "metadata; using 'hann'."
+                )
+            else:
+                values["frequency_window"] = frequency_window
+            frequency_normalization = str(
+                values.get("frequency_normalization", "")
+            ).lower()
+            if frequency_normalization not in {"relative", "physical"}:
+                values["frequency_normalization"] = "relative"
+                print(
+                    "Warning: frequency_normalization is missing or invalid in the "
+                    "saved metadata; using 'relative'."
+                )
+            else:
+                values["frequency_normalization"] = frequency_normalization
+
+    values["use_validation"] = parse_bool(
+        values.get("use_validation", True), default=True
+    )
     values["num_workers"] = max(0, int(values.get("num_workers", 0)))
     values["seed"] = int(values.get("seed", 42))
 
@@ -339,6 +431,15 @@ def extract_split(
     normalize: bool,
 ) -> tuple[np.ndarray, np.ndarray, list[str] | None]:
     dataset, _ = exp._get_data(flag=split)
+    return extract_dataset(exp, dataset, normalize=normalize)
+
+
+def extract_dataset(
+    exp: Exp_Stage1_Feature,
+    dataset,
+    normalize: bool,
+) -> tuple[np.ndarray, np.ndarray, list[str] | None]:
+    """Extract embeddings from an already constructed dataset object."""
     loader = exp._build_eval_loader(dataset)
     features: list[np.ndarray] = []
     labels: list[np.ndarray] = []
@@ -355,7 +456,7 @@ def extract_split(
             labels.append(batch_label.detach().cpu().numpy().reshape(-1).astype(np.int64))
 
     if not features:
-        raise RuntimeError(f"No samples found in {split} split")
+        raise RuntimeError("No samples found in the requested dataset")
     class_names = getattr(dataset, "class_names", None)
     if class_names is not None:
         class_names = [str(name) for name in class_names]
@@ -445,8 +546,11 @@ def plot_distribution(
     sns.set_theme(style="darkgrid", context="notebook")
 
     if combined:
-        fig, axes = plt.subplots(1, 3, figsize=(15.0, 4.5), squeeze=False)
-        axes_list = list(axes[0])
+        panel_count = max(1, len(split_slices))
+        fig, axes = plt.subplots(
+            1, panel_count, figsize=(5.0 * panel_count, 4.5), squeeze=False
+        )
+        axes_list = list(np.atleast_1d(axes[0]))
         fig.subplots_adjust(left=0.04, right=0.80, bottom=0.13, top=0.88, wspace=0.22)
     else:
         fig, ax = plt.subplots(figsize=(7.2, 5.0))
@@ -539,18 +643,48 @@ def main() -> None:
     exp.model.eval()
 
     split_data: dict[str, tuple[np.ndarray, np.ndarray, list[str] | None]] = {}
-    for split in ("TRAIN", "VAL", "TEST"):
-        features, labels, class_names = extract_split(
-            exp, split, normalize=not cli.no_normalize
+    validation_enabled = parse_bool(
+        getattr(runtime_args, "use_validation", True), default=True
+    )
+    if validation_enabled:
+        split_names = ("TRAIN", "VAL", "TEST")
+        for split in split_names:
+            features, labels, class_names = extract_split(
+                exp, split, normalize=not cli.no_normalize
+            )
+            split_data[split.lower()] = (features, labels, class_names)
+    else:
+        # Stage-1 no-validation training folds the original validation samples
+        # into training.  Reproduce that exact split here so the plotted
+        # training distribution corresponds to what the checkpoint saw.
+        raw_train_data, _ = exp._get_data(flag="TRAIN")
+        raw_val_data, _ = exp._get_data(flag="VAL")
+        merged_train_data = exp._merge_datasets(raw_train_data, raw_val_data)
+        features, labels, class_names = extract_dataset(
+            exp, merged_train_data, normalize=not cli.no_normalize
         )
-        split_data[split.lower()] = (features, labels, class_names)
+        split_data["train"] = (features, labels, class_names)
+        test_features, test_labels, test_class_names = extract_split(
+            exp, "TEST", normalize=not cli.no_normalize
+        )
+        split_data["test"] = (test_features, test_labels, test_class_names)
+
+    print(f"Validation enabled: {validation_enabled}")
+    for split, (features, labels, _class_names) in split_data.items():
         print(
-            f"{split:<5}: samples={len(features)}, feature_dim={features.shape[1]}, "
+            f"{split.upper():<5}: samples={len(features)}, feature_dim={features.shape[1]}, "
             f"classes={len(np.unique(labels))}"
         )
 
     output_dir = cli.output_dir.expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
+    if not validation_enabled:
+        # Avoid leaving a stale validation-only image from an earlier run in
+        # the same output directory, which could be mistaken for this result.
+        stale_val_plot = output_dir / "feature_distribution_val.png"
+        if stale_val_plot.exists():
+            stale_val_plot.unlink()
+            print(f"Removed stale validation plot: {stale_val_plot}")
 
     class_names = next(
         (entry[2] for entry in split_data.values() if entry[2] is not None), None
@@ -569,7 +703,7 @@ def main() -> None:
     )
 
     # Subsample only the plotted points; features.npz always contains every
-    # sample from all three splits.
+    # sample from all available splits.
     plotted_features: list[np.ndarray] = []
     plotted_labels: dict[str, np.ndarray] = {}
     split_slices: dict[str, slice] = {}
@@ -631,6 +765,8 @@ def main() -> None:
         else str(split_summary_path.resolve()),
         "method": cli.method,
         "normalized": not cli.no_normalize,
+        "validation_enabled": validation_enabled,
+        "plotted_splits": list(split_data),
         "max_points_per_split": cli.max_points,
         "seed": runtime_args.seed,
         "splits": {

@@ -104,43 +104,24 @@ if __name__ == "__main__":
     parser.add_argument("--eeg_hf_dataset_id", type=str, default="luigi-s/EEG_Image_CVPR_ALL_subj")
     parser.add_argument("--eeg_hf_cache_dir", type=str_or_none, default=None)
 
-    parser.add_argument("--seq_len", type=int, default=512, help="input sequence length")
-    parser.add_argument(
-        "--sampling_rate",
-        type=float,
-        default=None,
-        help=(
-            "EEG sampling rate in Hz; required when the DA4FE "
-            "frequency branch is enabled"
-        ),
-    )
-    parser.add_argument(
-        "--frequency_window",
-        type=str,
-        default="hann",
-        choices=["hann", "rectangular"],
-        help="window used before rFFT in the DA4FE frequency branch",
-    )
-    parser.add_argument(
-        "--frequency_normalization",
-        type=str,
-        default="relative",
-        choices=["relative", "physical"],
-        help=(
-            "frequency normalization: relative power (recommended) "
-            "or physical PSD"
-        ),
-    )
+    parser.add_argument("--seq_len", type=int, default=500, help="input sequence length")
+    parser.add_argument("--sampling_rate", type=float, default=1000., help=("EEG sampling rate in Hz; required when the DA4FE " "frequency branch is enabled" ),)
+    parser.add_argument("--frequency_window",type=str, default="hann", choices=["hann", "rectangular"], help="window used before rFFT in the DA4FE frequency branch",)
+    parser.add_argument("--frequency_normalization", type=str, default="relative", choices=["relative", "physical"], help=("frequency normalization: relative power (recommended) ""or physical PSD"), )
+
     parser.add_argument("--patch_len", type=int, default=4, help="cross-channel patch length")
     parser.add_argument("--enc_in", type=int, default=128, help="encoder input size")
     parser.add_argument("--d_model", type=int, default=256, help="model dimension")
     parser.add_argument("--n_heads", type=int, default=6, help="number of heads")
+
     parser.add_argument("--t_layer", type=int, default=4, help="temporal encoder layers")
     parser.add_argument("--v_layer", type=int, default=4, help="channel encoder layers")
     parser.add_argument("--f_layer", type=int, default=4, help="frequency encoder layers")
+
     parser.add_argument("--da4fe_channel_dim", type=int, default=64)
     parser.add_argument("--da4fe_temporal_dim", type=int, default=64)
     parser.add_argument("--da4fe_frequency_dim", type=int, default=64)
+
     parser.add_argument("--da4fe_fusion_mode", type=str, default="concat_mlp", choices=["add", "concat_mlp"])
     parser.add_argument("--da4fe_fusion_hidden_dim", type=int, default=512)
     parser.add_argument("--da4fe_fusion_out_dim", type=int, default=256)
@@ -152,24 +133,24 @@ if __name__ == "__main__":
     parser.add_argument(
         "--augmentations",
         type=str,
-        default="flip0.8,frequency0.,jitter0.,mask0.0,channel0.4,drop0.0",
+        default="flip0.4,frequency0.,jitter0.,mask0.0,channel0.4,drop0.0",
     )
-    parser.add_argument("--eeg_normalize", type=str2bool, default=False)
+    parser.add_argument("--eeg_normalize", type=str2bool, default=False)   # *******
     parser.add_argument("--eeg_num_classes", type=int, default=0)
     parser.add_argument("--eeg_adaptive_seq_len", type=str2bool, default=True)
 
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--log_dir", type=str_or_none, default=None)
     parser.add_argument("--itr", type=int, default=1)
-    parser.add_argument("--train_epochs", type=int, default=500)
-    parser.add_argument("--batch_size", type=int, default=16)
-    parser.add_argument("--patience", type=int, default=16)
-    parser.add_argument("--learning_rate", type=float, default=5e-5)
+    parser.add_argument("--train_epochs", type=int, default=1000)
+    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--patience", type=int, default=500)
+    parser.add_argument("--learning_rate", type=float, default=2e-4)
 
     parser.add_argument(
         "--stage1_loss",
         type=str,
-        default="triplet",
+        default="cosface_triplet",
         choices=[
             "triplet",
             "ce",
@@ -188,30 +169,32 @@ if __name__ == "__main__":
         choices=["semihard", "batch_hard"],
         help="triplet miner type when stage1 loss includes triplet",
     )
-    parser.add_argument(
+    parser.add_argument(  # ******
         "--stage1_triplet_margin",
         type=float,
-        default=0.8,
+        default=0.9,
         help="margin used by stage1 triplet loss",
     )
-    parser.add_argument(
+    parser.add_argument( # *******
         "--stage1_ce_weight",
         type=float,
-        default=0.5,
+        default=0.4,
         help="weight of cross-entropy style loss when stage1 loss includes classification supervision",
     )
-    parser.add_argument(
+
+    parser.add_argument(   # ******
         "--stage1_triplet_weight",
         type=float,
         default=1.0,
         help="weight of triplet loss when stage1 loss includes triplet supervision",
     )
-    parser.add_argument(
+    parser.add_argument(  #*****
         "--stage1_label_smoothing",
         type=float,
         default=0.05,
         help="label smoothing used by CE, ArcFace, and CosFace losses",
     )
+
     parser.add_argument(
         "--stage1_arcface_s",
         type=float,
@@ -221,19 +204,20 @@ if __name__ == "__main__":
     parser.add_argument(
         "--stage1_arcface_m",
         type=float,
-        default=0.5,
+        default=0.8,
         help="ArcFace angular margin",
     )
-    parser.add_argument(
+
+    parser.add_argument(   # ****
         "--stage1_cosface_s",
         type=float,
         default=30.0,
         help="CosFace scale parameter",
     )
-    parser.add_argument(
+    parser.add_argument(   # *****
         "--stage1_cosface_m",
         type=float,
-        default=0.35,
+        default=0.8,
         help="CosFace cosine margin",
     )
     parser.add_argument(
@@ -245,7 +229,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--stage1_samples_per_class",
         type=int,
-        default=16,
+        default=4,
         help="number of samples per class inside each stage1 batch when triplet loss is used",
     )
     parser.add_argument("--resume_ckpt", type=str_or_none, default=None)
@@ -254,7 +238,7 @@ if __name__ == "__main__":
         "--use_validation",
         "--use_val",
         type=str2bool,
-        default=True,
+        default=False,
         help=(
             "whether to keep a validation split for checkpoint selection; "
             "when false, validation samples are merged into training and test "
@@ -264,7 +248,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--result_dir",
         type=str_or_none,
-        default=None,
+        default="../result",
         help="root directory for outputs; default is ../result next to the source tree",
     )
 

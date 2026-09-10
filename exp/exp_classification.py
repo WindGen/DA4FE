@@ -21,6 +21,7 @@ from sklearn.metrics import f1_score
 from sklearn.metrics import roc_auc_score
 from sklearn.metrics import average_precision_score
 from utils.checkpointing import load_model_state
+from tqdm.auto import tqdm
 
 warnings.filterwarnings("ignore")
 
@@ -401,14 +402,25 @@ class Exp_Classification(Exp_Basic):
         total_loss = ce_criterion(logits, labels.long())
         return total_loss, logits
 
-    def _evaluate_loader(self, data_loader, criterion):
+    def _evaluate_loader(self, data_loader, criterion, desc=None):
         total_loss = []
         preds = []
         trues = []
 
         self.model.eval()
         with torch.no_grad():
-            for batch_x, label, padding_mask in data_loader:
+            iterator = (
+                tqdm(
+                    data_loader,
+                    desc=desc,
+                    unit="batch",
+                    leave=False,
+                    dynamic_ncols=True,
+                )
+                if desc
+                else data_loader
+            )
+            for batch_x, label, padding_mask in iterator:
                 batch_x = batch_x.float().to(self.device)
                 padding_mask = padding_mask.float().to(self.device)
                 label = label.to(self.device)
@@ -422,6 +434,11 @@ class Exp_Classification(Exp_Basic):
 
                 preds.append(pred)
                 trues.append(label.detach().cpu())
+                if desc:
+                    iterator.set_postfix(
+                        loss=f"{loss.item():.4f}",
+                        refresh=False,
+                    )
 
         total_loss = float(np.average(total_loss))
         preds = torch.cat(preds, 0)
@@ -465,8 +482,12 @@ class Exp_Classification(Exp_Basic):
             return nn.CrossEntropyLoss()
         raise ValueError(f"Unsupported loss type: {self.args.loss}")
 
-    def vali(self, vali_data, vali_loader, criterion):
-        return self._evaluate_loader(vali_loader, criterion)
+    def vali(self, vali_data, vali_loader, criterion, desc=None):
+        return self._evaluate_loader(
+            vali_loader,
+            criterion,
+            desc=desc,
+        )
 
     def train(self, setting):
         train_data, train_loader = self._get_data(flag="TRAIN")
@@ -494,13 +515,27 @@ class Exp_Classification(Exp_Basic):
         self._reset_triplet_state()
         self._maybe_resume_from_checkpoint()
 
-        for epoch in range(self.args.train_epochs):
+        epoch_iterator = tqdm(
+            range(self.args.train_epochs),
+            desc="Training",
+            unit="epoch",
+            dynamic_ncols=True,
+        )
+        for epoch in epoch_iterator:
             iter_count = 0
             train_loss = []
 
             self.model.train()
             epoch_time = time.time()
-            for i, (batch_x, label, padding_mask) in enumerate(train_loader):
+            batch_iterator = tqdm(
+                enumerate(train_loader),
+                total=train_steps,
+                desc=f"Epoch {epoch + 1}/{self.args.train_epochs}",
+                unit="batch",
+                leave=False,
+                dynamic_ncols=True,
+            )
+            for i, (batch_x, label, padding_mask) in batch_iterator:
                 iter_count += 1
                 model_optim.zero_grad()
 
@@ -517,14 +552,31 @@ class Exp_Classification(Exp_Basic):
                 loss.backward()
                 nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=4.0)
                 model_optim.step()
+                batch_iterator.set_postfix(
+                    loss=f"{loss.item():.4f}",
+                    refresh=False,
+                )
 
             epoch_time_cost = time.time() - epoch_time
-            print("Epoch: {} cost time: {}".format(epoch + 1, epoch_time_cost))
+            tqdm.write(
+                "Epoch: {} cost time: {}".format(
+                    epoch + 1,
+                    epoch_time_cost,
+                )
+            )
             train_loss = float(np.average(train_loss))
             train_eval_loss, train_metrics_dict = self.vali(
-                train_data, train_loader, criterion
+                train_data,
+                train_loader,
+                criterion,
+                desc=f"Epoch {epoch + 1} train eval",
             )
-            vali_loss, val_metrics_dict = self.vali(vali_data, vali_loader, criterion)
+            vali_loss, val_metrics_dict = self.vali(
+                vali_data,
+                vali_loader,
+                criterion,
+                desc=f"Epoch {epoch + 1} val eval",
+            )
             current_lr = model_optim.param_groups[0]["lr"]
 
             self._append_metric_row(
@@ -547,7 +599,7 @@ class Exp_Classification(Exp_Basic):
                 steps=train_steps,
             )
 
-            print(
+            tqdm.write(
                 f"Epoch: {epoch + 1}, Steps: {train_steps}, | Train Step Loss: {train_loss:.5f}\n"
                 f"Train results --- Loss: {train_eval_loss:.5f}, "
                 f"Accuracy: {train_metrics_dict['Accuracy']:.5f}, "
@@ -566,6 +618,11 @@ class Exp_Classification(Exp_Basic):
                 f"AUROC: {val_metrics_dict['AUROC']:.5f}, "
                 f"AUPRC: {val_metrics_dict['AUPRC']:.5f}\n"
                 f"Triplet active: {int(self._is_triplet_active())}"
+            )
+            epoch_iterator.set_postfix(
+                train_loss=f"{train_eval_loss:.4f}",
+                val_f1=f"{val_metrics_dict['F1']:.4f}",
+                refresh=False,
             )
             self._maybe_activate_triplet(epoch, train_metrics_dict, val_metrics_dict)
             early_stopping(

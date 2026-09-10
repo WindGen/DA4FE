@@ -12,6 +12,7 @@ import torch.nn as nn
 from sklearn.linear_model import LogisticRegression
 from sklearn.neural_network import MLPClassifier
 from sklearn.preprocessing import StandardScaler
+from tqdm.auto import tqdm
 from sklearn.svm import LinearSVC, SVC
 
 from data_provider.data_factory import data_provider
@@ -179,19 +180,35 @@ class Exp_Stage2_Classifier(Exp_Basic):
         random.seed(self.args.seed)
         return data_provider(self.args, flag)
 
-    def _extract_split_features(self, data_loader):
+    def _extract_split_features(self, data_loader, desc=None):
         features = []
         labels = []
 
         self.model.eval()
         with torch.no_grad():
-            for batch_x, label, padding_mask in data_loader:
+            iterator = (
+                tqdm(
+                    data_loader,
+                    desc=desc,
+                    unit="batch",
+                    leave=False,
+                    dynamic_ncols=True,
+                )
+                if desc
+                else data_loader
+            )
+            for batch_x, label, padding_mask in iterator:
                 batch_x = batch_x.float().to(self.device)
                 model_outputs = self.model(batch_x, return_features=True)
                 _, fused = model_outputs
                 fused = nn.functional.normalize(fused, p=2, dim=1)
                 features.append(fused.cpu().numpy())
                 labels.append(label.cpu().numpy())
+                if desc:
+                    iterator.set_postfix(
+                        samples=sum(len(item) for item in labels),
+                        refresh=False,
+                    )
         self.model.train()
         return np.concatenate(features, axis=0), np.concatenate(labels, axis=0)
 
@@ -302,9 +319,18 @@ class Exp_Stage2_Classifier(Exp_Basic):
         )
         print(f"Loaded stage1 feature checkpoint: {self.args.resume_ckpt}")
 
-        train_x, train_y = self._extract_split_features(train_loader)
-        val_x, val_y = self._extract_split_features(vali_loader)
-        test_x, test_y = self._extract_split_features(test_loader)
+        train_x, train_y = self._extract_split_features(
+            train_loader,
+            desc="Extract train features",
+        )
+        val_x, val_y = self._extract_split_features(
+            vali_loader,
+            desc="Extract validation features",
+        )
+        test_x, test_y = self._extract_split_features(
+            test_loader,
+            desc="Extract test features",
+        )
 
         train_x, val_x, test_x, scaler = self._maybe_standardize(train_x, val_x, test_x)
 
