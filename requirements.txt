@@ -9,3 +9,4 @@ scipy==1.14.1
 seaborn==0.13.2
 torch==2.4.1
 tqdm==4.66.5
+pytorch-metric-learning>=2.3.0

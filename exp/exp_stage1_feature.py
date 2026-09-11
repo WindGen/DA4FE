@@ -15,6 +15,13 @@ from torch import optim
 from torch.utils.data import BatchSampler, ConcatDataset, DataLoader
 from tqdm.auto import tqdm
 
+try:
+    from pytorch_metric_learning import losses as pml_losses
+    from pytorch_metric_learning import miners as pml_miners
+except ImportError:  # Optional until a Multi-Similarity mode is selected.
+    pml_losses = None
+    pml_miners = None
+
 from data_provider.data_factory import data_provider
 from data_provider.uea import collate_fn
 from exp.exp_basic import Exp_Basic
@@ -84,6 +91,10 @@ class Stage1FeatureModel(nn.Module):
         self.feature_dim = feature_dim
         self.num_class = num_class
         self.loss_mode = getattr(args, "stage1_loss", "triplet").lower()
+        l2_normalize = getattr(args, "stage1_l2_normalize", True)
+        if isinstance(l2_normalize, str):
+            l2_normalize = l2_normalize.strip().lower() in {"true", "1", "yes", "y", "on"}
+        self.l2_normalize_features = bool(l2_normalize)
         self.margin_head = None
 
         if self.loss_mode in {"arcface", "arcface_triplet"}:
@@ -104,6 +115,8 @@ class Stage1FeatureModel(nn.Module):
     def forward(self, x_enc, return_features=False):
         logits, fused = self.backbone(x_enc, return_features=True)
         if return_features:
+            if self.l2_normalize_features:
+                fused = F.normalize(fused, p=2, dim=-1)
             return logits, fused
         return logits
 
@@ -202,7 +215,7 @@ class ClassBalancedBatchSampler(BatchSampler):
         self.batch_size = batch_size
         if samples_per_class < 2:
             raise ValueError(
-                "stage1_samples_per_class must be >= 2 because triplet loss "
+                "stage1_samples_per_class must be >= 2 because metric learning "
                 "requires at least two samples from the same class in a batch."
             )
         self.samples_per_class = samples_per_class
@@ -326,13 +339,25 @@ class Exp_Stage1_Feature(Exp_Basic):
     ]
 
     TRIPLET_LOSS_MODES = {"triplet", "ce_triplet", "arcface_triplet", "cosface_triplet"}
-    CLASSIFICATION_LOSS_MODES = {"ce", "ce_triplet", "arcface", "arcface_triplet", "cosface", "cosface_triplet"}
+    MULTI_SIMILARITY_LOSS_MODES = {"multi_similarity", "ce_multi_similarity"}
+    METRIC_LOSS_MODES = TRIPLET_LOSS_MODES | MULTI_SIMILARITY_LOSS_MODES
+    CLASSIFICATION_LOSS_MODES = {
+        "ce",
+        "ce_triplet",
+        "arcface",
+        "arcface_triplet",
+        "cosface",
+        "cosface_triplet",
+        "ce_multi_similarity",
+    }
 
     def __init__(self, args):
         self.loss_mode = getattr(args, "stage1_loss", "triplet").lower()
         self.use_validation = bool(getattr(args, "use_validation", True))
         self.triplet_miner = None
         self.triplet_criterion = None
+        self.ms_miner = None
+        self.ms_criterion = None
         self.classification_criterion = None
         super().__init__(args)
         self.metrics_log_path = None
@@ -522,11 +547,17 @@ class Exp_Stage1_Feature(Exp_Basic):
     def _use_triplet_loss(self):
         return self.loss_mode in self.TRIPLET_LOSS_MODES
 
+    def _use_multi_similarity_loss(self):
+        return self.loss_mode in self.MULTI_SIMILARITY_LOSS_MODES
+
+    def _use_metric_loss(self):
+        return self.loss_mode in self.METRIC_LOSS_MODES
+
     def _use_classification_loss(self):
         return self.loss_mode in self.CLASSIFICATION_LOSS_MODES
 
     def _build_train_loader(self, train_data):
-        if not self._use_triplet_loss():
+        if not self._use_metric_loss():
             return DataLoader(
                 train_data,
                 batch_size=self.args.batch_size,
@@ -582,6 +613,24 @@ class Exp_Stage1_Feature(Exp_Basic):
             self.triplet_miner = None
             self.triplet_criterion = None
 
+        if self._use_multi_similarity_loss():
+            if pml_miners is None or pml_losses is None:
+                raise ImportError(
+                    "Multi-Similarity training requires pytorch-metric-learning. "
+                    "Install it with `pip install pytorch-metric-learning`."
+                )
+            self.ms_miner = pml_miners.MultiSimilarityMiner(
+                epsilon=float(getattr(self.args, "stage1_ms_epsilon", 0.1))
+            )
+            self.ms_criterion = pml_losses.MultiSimilarityLoss(
+                alpha=float(getattr(self.args, "stage1_ms_alpha", 2.0)),
+                beta=float(getattr(self.args, "stage1_ms_beta", 50.0)),
+                base=float(getattr(self.args, "stage1_ms_base", 0.5)),
+            )
+        else:
+            self.ms_miner = None
+            self.ms_criterion = None
+
     def _extract_features(self, batch_x):
         logits, fused_features = self.model(batch_x, return_features=True)
         embeddings = F.normalize(fused_features, p=2, dim=1)
@@ -603,6 +652,38 @@ class Exp_Stage1_Feature(Exp_Basic):
         )
         return loss, int(anchor_idx.numel())
 
+    def _compute_multi_similarity_component(self, embeddings, labels):
+        if not self._use_multi_similarity_loss():
+            return embeddings.sum() * 0.0, 0
+
+        labels = labels.reshape(-1).long()
+        hard_pairs = self.ms_miner(embeddings, labels)
+        if hard_pairs is None:
+            return embeddings.sum() * 0.0, 0
+
+        # MultiSimilarityMiner returns (positive_anchor, positive, negative_anchor,
+        # negative).  Count pairs rather than the four index tensors.
+        if len(hard_pairs) == 4:
+            pair_count = int(hard_pairs[0].numel() + hard_pairs[2].numel())
+        else:
+            pair_count = sum(int(pair_indices.numel()) for pair_indices in hard_pairs)
+        if pair_count == 0:
+            return embeddings.sum() * 0.0, 0
+
+        loss = self.ms_criterion(
+            embeddings,
+            labels,
+            indices_tuple=hard_pairs,
+        )
+        return loss, pair_count
+
+    def _compute_metric_component(self, embeddings, labels):
+        if self._use_triplet_loss():
+            return self._compute_triplet_component(embeddings, labels)
+        if self._use_multi_similarity_loss():
+            return self._compute_multi_similarity_component(embeddings, labels)
+        return embeddings.sum() * 0.0, 0
+
     def _compute_classification_component(self, logits, embeddings, labels):
         if not self._use_classification_loss():
             return embeddings.sum() * 0.0
@@ -622,12 +703,12 @@ class Exp_Stage1_Feature(Exp_Basic):
         classification_loss = self._compute_classification_component(
             logits, embeddings, labels
         )
-        metric_loss, mined_triplets = self._compute_triplet_component(embeddings, labels)
+        metric_loss, mined_triplets = self._compute_metric_component(embeddings, labels)
 
         total_loss = logits.sum() * 0.0
         if self._use_classification_loss():
             total_loss = total_loss + self.args.stage1_ce_weight * classification_loss
-        if self._use_triplet_loss():
+        if self._use_metric_loss():
             total_loss = total_loss + self.args.stage1_triplet_weight * metric_loss
 
         return (

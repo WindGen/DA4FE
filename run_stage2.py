@@ -34,7 +34,8 @@ def str_or_none(value):
 def build_stage2_full_setting(args):
     setting = (
         f"{args.model}_{args.data}_seed_{args.seed}_stage2_heads_{args.stage2_classifier_heads}"
-        f"_std_{int(args.stage2_standardize_features)}_bs_{args.batch_size}"
+        f"_std_{int(args.stage2_standardize_features)}"
+        f"_l2norm_{int(args.stage1_l2_normalize)}_bs_{args.batch_size}"
     )
     if args.model == "DA4FE":
         setting += (
@@ -138,6 +139,9 @@ if __name__ == "__main__":
     parser.add_argument("--eeg_normalize", type=str2bool, default=False)
     parser.add_argument("--eeg_num_classes", type=int, default=0)
     parser.add_argument("--eeg_adaptive_seq_len", type=str2bool, default=True)
+
+    # Feature preprocessing before Stage-2 classifiers.
+    parser.add_argument("--stage1_l2_normalize", "--stage1-l2-normalize", type=str2bool, default=True, help="L2-normalize Stage-1 features before Stage-2 classifiers")
 
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--batch_size", type=int, default=32)

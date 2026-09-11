@@ -183,6 +183,9 @@ class Exp_Stage2_Classifier(Exp_Basic):
     def _extract_split_features(self, data_loader, desc=None):
         features = []
         labels = []
+        l2_normalize = getattr(self.args, "stage1_l2_normalize", True)
+        if isinstance(l2_normalize, str):
+            l2_normalize = l2_normalize.strip().lower() in {"true", "1", "yes", "y", "on"}
 
         self.model.eval()
         with torch.no_grad():
@@ -201,7 +204,8 @@ class Exp_Stage2_Classifier(Exp_Basic):
                 batch_x = batch_x.float().to(self.device)
                 model_outputs = self.model(batch_x, return_features=True)
                 _, fused = model_outputs
-                fused = nn.functional.normalize(fused, p=2, dim=1)
+                if l2_normalize:
+                    fused = nn.functional.normalize(fused, p=2, dim=1)
                 features.append(fused.cpu().numpy())
                 labels.append(label.cpu().numpy())
                 if desc:

@@ -12,8 +12,9 @@ Example (local EEG-ImageNet):
         --checkpoint checkpoints/DA4FE/stage1/<run>/checkpoint.pth \
         --method tsne
 
-The script writes all normalized embeddings to ``features.npz`` and creates
-one comparable plot plus one plot for each available split.  Runs trained with
+The script writes all extracted embeddings to ``features.npz`` and creates
+one comparable plot plus one plot for each available split.  Final feature L2
+normalization follows ``stage1_l2_normalize`` in the saved run parameters. Runs trained with
 ``use_validation=false`` produce only train and test panels; the original
 training and validation samples are merged into the train panel to match the
 training procedure.
@@ -95,6 +96,11 @@ DEFAULT_ARGS: dict[str, Any] = {
     "stage1_loss": "triplet",
     "stage1_triplet_type": "semihard",
     "stage1_triplet_margin": 0.2,
+    "stage1_ms_epsilon": 0.1,
+    "stage1_ms_alpha": 2.0,
+    "stage1_ms_beta": 50.0,
+    "stage1_ms_base": 0.5,
+    "stage1_l2_normalize": True,
     "stage1_ce_weight": 1.0,
     "stage1_triplet_weight": 1.0,
     "stage1_label_smoothing": 0.0,
@@ -232,6 +238,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="do not L2-normalize embeddings before saving/reduction",
     )
+    parser.add_argument("--stage1_l2_normalize", "--stage1-l2-normalize", type=parse_bool, default=None, help="override final Stage-1 feature L2 normalization")
     return parser.parse_args()
 
 
@@ -326,6 +333,7 @@ def build_runtime_args(
         "eeg_hf_cache_dir": cli.eeg_hf_cache_dir,
         "seq_len": cli.seq_len,
         "sampling_rate": cli.sampling_rate,
+        "stage1_l2_normalize": cli.stage1_l2_normalize,
         "batch_size": cli.batch_size,
         "num_workers": cli.num_workers,
         "seed": cli.seed,
@@ -389,6 +397,9 @@ def build_runtime_args(
 
     values["use_validation"] = parse_bool(
         values.get("use_validation", True), default=True
+    )
+    values["stage1_l2_normalize"] = parse_bool(
+        values.get("stage1_l2_normalize", True), default=True
     )
     values["num_workers"] = max(0, int(values.get("num_workers", 0)))
     values["seed"] = int(values.get("seed", 42))
@@ -631,6 +642,11 @@ def main() -> None:
         cli.args_json,
     )
     runtime_args = build_runtime_args(saved_args, cli)
+    if cli.no_normalize:
+        # Keep the legacy --no-normalize switch authoritative for both the
+        # model's returned feature and the saved/reduced feature arrays.
+        runtime_args.stage1_l2_normalize = False
+    feature_normalize = bool(runtime_args.stage1_l2_normalize)
 
     print(f"Loading checkpoint: {checkpoint_path}")
     if run_params_path is not None:
@@ -638,6 +654,7 @@ def main() -> None:
     if split_summary_path is not None:
         print(f"Loaded split summary: {split_summary_path}")
     print(f"Using device: {'cuda' if runtime_args.use_gpu else 'cpu'}")
+    print(f"Final feature L2 normalize: {feature_normalize}")
     exp = Exp_Stage1_Feature(runtime_args)
     load_model_state(exp.model, checkpoint, map_location=exp.device)
     exp.model.eval()
@@ -650,7 +667,7 @@ def main() -> None:
         split_names = ("TRAIN", "VAL", "TEST")
         for split in split_names:
             features, labels, class_names = extract_split(
-                exp, split, normalize=not cli.no_normalize
+                exp, split, normalize=feature_normalize
             )
             split_data[split.lower()] = (features, labels, class_names)
     else:
@@ -661,11 +678,11 @@ def main() -> None:
         raw_val_data, _ = exp._get_data(flag="VAL")
         merged_train_data = exp._merge_datasets(raw_train_data, raw_val_data)
         features, labels, class_names = extract_dataset(
-            exp, merged_train_data, normalize=not cli.no_normalize
+            exp, merged_train_data, normalize=feature_normalize
         )
         split_data["train"] = (features, labels, class_names)
         test_features, test_labels, test_class_names = extract_split(
-            exp, "TEST", normalize=not cli.no_normalize
+            exp, "TEST", normalize=feature_normalize
         )
         split_data["test"] = (test_features, test_labels, test_class_names)
 
@@ -764,7 +781,8 @@ def main() -> None:
         if split_summary_path is None
         else str(split_summary_path.resolve()),
         "method": cli.method,
-        "normalized": not cli.no_normalize,
+        "normalized": feature_normalize,
+        "stage1_l2_normalize": feature_normalize,
         "validation_enabled": validation_enabled,
         "plotted_splits": list(split_data),
         "max_points_per_split": cli.max_points,

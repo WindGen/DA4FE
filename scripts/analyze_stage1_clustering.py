@@ -111,6 +111,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="do not L2-normalize fused features before clustering",
     )
+    parser.add_argument("--stage1_l2_normalize", "--stage1-l2-normalize", type=parse_bool, default=None, help="override final Stage-1 feature L2 normalization")
     parser.add_argument(
         "--max-points",
         type=int,
@@ -290,12 +291,18 @@ def main() -> None:
         eeg_hf_cache_dir=None,
         seq_len=None,
         sampling_rate=cli.sampling_rate,
+        stage1_l2_normalize=cli.stage1_l2_normalize,
         batch_size=cli.batch_size,
         num_workers=cli.num_workers,
         seed=cli.seed,
         device=cli.device,
     )
     runtime_args = build_runtime_args(saved_args, cli_for_runtime)
+    if cli.no_normalize:
+        # Keep the legacy --no-normalize switch authoritative for both the
+        # model's returned feature and the KMeans input.
+        runtime_args.stage1_l2_normalize = False
+    feature_normalize = bool(runtime_args.stage1_l2_normalize)
 
     print(f"Loading checkpoint: {checkpoint_path}")
     if run_params_path is not None:
@@ -303,6 +310,7 @@ def main() -> None:
     if split_summary_path is not None:
         print(f"Loaded split summary: {split_summary_path}")
     print(f"Using device: {'cuda' if runtime_args.use_gpu else 'cpu'}")
+    print(f"Final feature L2 normalize: {feature_normalize}")
 
     exp = Exp_Stage1_Feature(runtime_args)
     load_model_state(exp.model, checkpoint, map_location=exp.device)
@@ -316,18 +324,18 @@ def main() -> None:
         for split in ("TRAIN", "VAL", "TEST"):
             dataset, _ = exp._get_data(flag=split)
             split_data[split.lower()] = extract_dataset(
-                exp, dataset, normalize=not cli.no_normalize
+                exp, dataset, normalize=feature_normalize
             )
     else:
         raw_train, _ = exp._get_data(flag="TRAIN")
         raw_val, _ = exp._get_data(flag="VAL")
         merged_train = exp._merge_datasets(raw_train, raw_val)
         split_data["train"] = extract_dataset(
-            exp, merged_train, normalize=not cli.no_normalize
+            exp, merged_train, normalize=feature_normalize
         )
         test_data, _ = exp._get_data(flag="TEST")
         split_data["test"] = extract_dataset(
-            exp, test_data, normalize=not cli.no_normalize
+            exp, test_data, normalize=feature_normalize
         )
 
     for split, (features, labels, subjects, _class_names) in split_data.items():
@@ -504,7 +512,8 @@ def main() -> None:
         "analyzed_splits": list(split_data),
         "n_clusters": cli.n_clusters,
         "true_class_count": num_classes,
-        "normalized": not cli.no_normalize,
+        "normalized": feature_normalize,
+        "stage1_l2_normalize": feature_normalize,
         "kmeans_samples": int(len(all_features)),
         "wrong_samples": int(total_wrong),
         "wrong_rate_pct": 100.0 * total_wrong / len(all_features),
