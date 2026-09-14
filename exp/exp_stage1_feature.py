@@ -592,7 +592,14 @@ class Exp_Stage1_Feature(Exp_Basic):
         )
 
     def _select_optimizer(self):
-        return optim.Adam(self.model.parameters(), lr=self.args.learning_rate)
+        weight_decay = float(getattr(self.args, "stage1_weight_decay", 0.0))
+        if weight_decay < 0:
+            raise ValueError("stage1_weight_decay must be non-negative")
+        return optim.AdamW(
+            self.model.parameters(),
+            lr=self.args.learning_rate,
+            weight_decay=weight_decay,
+        )
 
     def _select_criterion(self):
         self.classification_criterion = nn.CrossEntropyLoss(

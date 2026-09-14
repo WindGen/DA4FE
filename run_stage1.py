@@ -35,7 +35,7 @@ def build_stage1_full_setting(args):
     setting = (
         f"{args.model}_{args.data}_seed_{args.seed}_dm_{args.d_model}_dp_{args.dropout}"
         f"_tl_{args.t_layer}_vl_{args.v_layer}_fl_{args.f_layer}_bs_{args.batch_size}"
-        f"_lr{args.learning_rate}_aug_{args.augmentations}_pl_{args.patch_len}"
+        f"_lr{args.learning_rate}_wd{args.stage1_weight_decay}_aug_{args.augmentations}_pl_{args.patch_len}"
         f"_loss_{args.stage1_loss}_trip_{args.stage1_triplet_type}_tm_{args.stage1_triplet_margin}"
         f"_mse_{args.stage1_ms_epsilon}_msa_{args.stage1_ms_alpha}"
         f"_msb_{args.stage1_ms_beta}_msbase_{args.stage1_ms_base}"
@@ -108,33 +108,33 @@ if __name__ == "__main__":
     parser.add_argument("--data_path", type=str, default="EEG-ImageNet", help="data file")
     parser.add_argument("--eeg_hf_dataset_id", type=str, default="luigi-s/EEG_Image_CVPR_ALL_subj")
     parser.add_argument("--eeg_hf_cache_dir", type=str_or_none, default=None)
-    parser.add_argument("--seq_len", type=int, default=500, help="input sequence length")
+    parser.add_argument("--seq_len", type=int, default=512, help="input sequence length")
     parser.add_argument("--sampling_rate", type=float, default=1000.0, help="EEG sampling rate in Hz for the DA4FE frequency branch")
     parser.add_argument("--frequency_window", type=str, default="hann", choices=["hann", "rectangular"], help="window used before rFFT in the DA4FE frequency branch")
     parser.add_argument("--frequency_normalization", type=str, default="relative", choices=["relative", "physical"], help="frequency normalization: relative power or physical PSD")
 
     # Backbone architecture and DA4FE fusion configuration.
-    parser.add_argument("--patch_len", type=int, default=4, help="cross-channel patch length")
+    parser.add_argument("--patch_len", type=int, default=16, help="cross-channel patch length")
     parser.add_argument("--enc_in", type=int, default=128, help="encoder input size")
     parser.add_argument("--d_model", type=int, default=256, help="model dimension")
-    parser.add_argument("--n_heads", type=int, default=6, help="number of heads")
-    parser.add_argument("--t_layer", type=int, default=4, help="temporal encoder layers")
-    parser.add_argument("--v_layer", type=int, default=4, help="channel encoder layers")
-    parser.add_argument("--f_layer", type=int, default=4, help="frequency encoder layers")
-    parser.add_argument("--da4fe_channel_dim", type=int, default=64)
-    parser.add_argument("--da4fe_temporal_dim", type=int, default=64)
-    parser.add_argument("--da4fe_frequency_dim", type=int, default=64)
+    parser.add_argument("--n_heads", type=int, default=12, help="number of heads")
+    parser.add_argument("--t_layer", type=int, default=8, help="temporal encoder layers")
+    parser.add_argument("--v_layer", type=int, default=8, help="channel encoder layers")
+    parser.add_argument("--f_layer", type=int, default=8, help="frequency encoder layers")
+    parser.add_argument("--da4fe_channel_dim", type=int, default=128)
+    parser.add_argument("--da4fe_temporal_dim", type=int, default=128)
+    parser.add_argument("--da4fe_frequency_dim", type=int, default=128)
     parser.add_argument("--da4fe_fusion_mode", type=str, default="concat_mlp", choices=["add", "concat_mlp"])
-    parser.add_argument("--da4fe_fusion_hidden_dim", type=int, default=512)
-    parser.add_argument("--da4fe_fusion_out_dim", type=int, default=256)
+    parser.add_argument("--da4fe_fusion_hidden_dim", type=int, default=256)
+    parser.add_argument("--da4fe_fusion_out_dim", type=int, default=512)
     parser.add_argument("--da4fe_channel_weight", type=float, default=1.0)
     parser.add_argument("--da4fe_temporal_weight", type=float, default=1.0)
     parser.add_argument("--da4fe_frequency_weight", type=float, default=1.0)
-    parser.add_argument("--dropout", type=float, default=0.3)
+    parser.add_argument("--dropout", type=float, default=0.4)
 
     # EEG preprocessing and augmentation.
-    parser.add_argument("--augmentations", type=str, default="flip0.4,frequency0.,jitter0.,mask0.0,channel0.4,drop0.0")
-    parser.add_argument("--eeg_normalize", type=str2bool, default=False)
+    parser.add_argument("--augmentations", type=str, default="flip0.1,frequency0.05,jitter0.05,mask0.05,channel0.1,drop0.05")
+    parser.add_argument("--eeg_normalize", type=str2bool, default=True)
     parser.add_argument("--eeg_num_classes", type=int, default=0)
     parser.add_argument("--eeg_adaptive_seq_len", type=str2bool, default=True)
 
@@ -146,21 +146,22 @@ if __name__ == "__main__":
     parser.add_argument("--log_dir", type=str_or_none, default=None)
     parser.add_argument("--itr", type=int, default=1)
     parser.add_argument("--train_epochs", type=int, default=1000)
-    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--patience", type=int, default=500)
     parser.add_argument("--learning_rate", type=float, default=2e-4)
+    parser.add_argument("--stage1_weight_decay", "--stage1-weight-decay", type=float, default=1e-4, help="AdamW weight decay for Stage-1 training")
 
     # Stage-1 loss and metric-learning configuration.
-    parser.add_argument("--stage1_loss", type=str, default="cosface_triplet", choices=["triplet", "ce", "ce_triplet", "multi_similarity", "ce_multi_similarity", "arcface", "arcface_triplet", "cosface", "cosface_triplet"], help="stage1 loss type")
+    parser.add_argument("--stage1_loss", type=str, default="ce_multi_similarity", choices=["triplet", "ce", "ce_triplet", "multi_similarity", "ce_multi_similarity", "arcface", "arcface_triplet", "cosface", "cosface_triplet"], help="stage1 loss type")
     parser.add_argument("--stage1_triplet_type", type=str, default="semihard", choices=["semihard", "batch_hard"], help="triplet miner type when stage1 loss includes triplet")
     parser.add_argument("--stage1_triplet_margin", type=float, default=0.9, help="margin used by stage1 triplet loss")
-    parser.add_argument("--stage1_ms_epsilon", type=float, default=0.1, help="MultiSimilarityMiner hard-pair mining threshold")
+    parser.add_argument("--stage1_ms_epsilon", type=float, default=0.3, help="MultiSimilarityMiner hard-pair mining threshold")
     parser.add_argument("--stage1_ms_alpha", type=float, default=2.0, help="MultiSimilarityLoss positive-pair scale")
     parser.add_argument("--stage1_ms_beta", type=float, default=50.0, help="MultiSimilarityLoss negative-pair scale")
     parser.add_argument("--stage1_ms_base", type=float, default=0.5, help="MultiSimilarityLoss similarity base")
     parser.add_argument("--stage1_ce_weight", type=float, default=0.4, help="weight of cross-entropy classification loss")
     parser.add_argument("--stage1_triplet_weight", type=float, default=1.0, help="weight of the metric loss (Triplet or Multi-Similarity)")
-    parser.add_argument("--stage1_label_smoothing", type=float, default=0.05, help="label smoothing used by classification losses")
+    parser.add_argument("--stage1_label_smoothing", type=float, default=0.1, help="label smoothing used by classification losses")
 
     # Margin heads and evaluation sampling.
     parser.add_argument("--stage1_arcface_s", type=float, default=30.0, help="ArcFace scale parameter")
@@ -168,7 +169,7 @@ if __name__ == "__main__":
     parser.add_argument("--stage1_cosface_s", type=float, default=30.0, help="CosFace scale parameter")
     parser.add_argument("--stage1_cosface_m", type=float, default=0.8, help="CosFace cosine margin")
     parser.add_argument("--stage1_kmeans_clusters", type=int, default=0, help="number of KMeans clusters; 0 uses dataset class count")
-    parser.add_argument("--stage1_samples_per_class", type=int, default=4, help="samples per class in each metric-learning batch")
+    parser.add_argument("--stage1_samples_per_class", type=int, default=8, help="samples per class in each metric-learning batch")
 
     # Checkpointing and train/validation split.
     parser.add_argument("--resume_ckpt", type=str_or_none, default=None)
@@ -198,6 +199,8 @@ if __name__ == "__main__":
             "--sampling_rate must be a positive value when "
             "DA4FE frequency branch is enabled"
         )
+    if args.stage1_weight_decay < 0:
+        parser.error("--stage1_weight_decay must be non-negative")
     if args.result_dir is None:
         args.result_dir = str(Path(__file__).resolve().parent.parent / "result")
     args.requested_seq_len = args.seq_len
