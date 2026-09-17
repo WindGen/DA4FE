@@ -16,8 +16,10 @@ from sklearn.model_selection import train_test_split
 from natsort import natsorted
 
 try:
-    from datasets import load_dataset
+    from datasets import DatasetDict, concatenate_datasets, load_dataset
 except ImportError:  # pragma: no cover - optional runtime dependency
+    DatasetDict = None
+    concatenate_datasets = None
     load_dataset = None
 
 warnings.filterwarnings("ignore")
@@ -639,6 +641,8 @@ class EEGImageNetHuggingFaceLoader(Dataset):
     _split_cache = {}
     _class_name_cache = {}
     _metadata_cache = {}
+    _all_dataset_cache = {}
+    _custom_split_cache = {}
 
     def __init__(self, args, root_path, flag=None):
         if load_dataset is None:
@@ -650,8 +654,40 @@ class EEGImageNetHuggingFaceLoader(Dataset):
         self.args = args
         self.root_path = root_path
         self.flag = str(flag).upper() if flag else "TRAIN"
+        self.split_mode = str(
+            getattr(args, "eeg_hf_split_mode", "original")
+        ).strip().lower()
+        if self.split_mode in {"hf", "huggingface", "native"}:
+            self.split_mode = "original"
+        elif self.split_mode in {"custom", "self_split", "self-split"}:
+            self.split_mode = "self"
+        if self.split_mode not in {"original", "self"}:
+            raise ValueError(
+                "eeg_hf_split_mode must be 'original' or 'self', "
+                f"got {self.split_mode!r}"
+            )
         self.normalize = getattr(args, "eeg_normalize", True)
         self.max_classes = getattr(args, "eeg_num_classes", 0)
+        self.split_seed = getattr(args, "eeg_hf_split_seed", None)
+        if self.split_seed is None:
+            self.split_seed = getattr(args, "seed", 42)
+        self.split_seed = int(self.split_seed)
+        self.split_ratios = np.asarray(
+            [
+                float(getattr(args, "eeg_hf_train_ratio", 0.6)),
+                float(getattr(args, "eeg_hf_val_ratio", 0.2)),
+                float(getattr(args, "eeg_hf_test_ratio", 0.2)),
+            ],
+            dtype=np.float64,
+        )
+        if np.any(self.split_ratios <= 0) or not np.isclose(
+            self.split_ratios.sum(), 1.0, atol=1e-6
+        ):
+            raise ValueError(
+                "eeg_hf_train_ratio, eeg_hf_val_ratio and "
+                "eeg_hf_test_ratio must be positive and sum to 1.0; "
+                f"got {self.split_ratios.tolist()}"
+            )
         self.target_seq_len = getattr(
             args, "requested_seq_len", getattr(args, "seq_len", None)
         )
@@ -666,13 +702,16 @@ class EEGImageNetHuggingFaceLoader(Dataset):
         self.cache_dir = getattr(args, "eeg_hf_cache_dir", None)
         self.split_name = self._resolve_split_name(self.flag)
 
-        raw_dataset = self._load_split(self.split_name)
         self.class_names = self._resolve_class_names()
         self.label_to_index = {
             class_name: idx for idx, class_name in enumerate(self.class_names)
         }
         self.num_class = len(self.class_names)
 
+        if self.split_mode == "self":
+            raw_dataset = self._load_custom_split(self.flag)
+        else:
+            raw_dataset = self._load_split(self.split_name)
         self.dataset = self._prepare_dataset(raw_dataset)
         self.max_seq_len, self.feature_dim = self._resolve_dataset_metadata()
         class_column = (
@@ -712,13 +751,251 @@ class EEGImageNetHuggingFaceLoader(Dataset):
         self._split_cache[cache_key] = dataset
         return dataset
 
+    def _load_all_dataset(self):
+        """Load and concatenate all Hugging Face splits for self-splitting."""
+        cache_key = (self.dataset_id, self.cache_dir)
+        cached = self._all_dataset_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        if DatasetDict is None or concatenate_datasets is None:
+            raise ImportError(
+                "Self-splitting the Hugging Face EEG dataset requires the "
+                "`datasets` package. Install it with `pip install datasets`."
+            )
+
+        dataset_dict = load_dataset(
+            self.dataset_id,
+            cache_dir=self.cache_dir,
+        )
+        if isinstance(dataset_dict, DatasetDict):
+            split_datasets = [dataset_dict[name] for name in dataset_dict.keys()]
+            if not split_datasets:
+                raise RuntimeError(
+                    f"No splits found in Hugging Face dataset {self.dataset_id}"
+                )
+            if len(split_datasets) == 1:
+                dataset = split_datasets[0]
+            else:
+                dataset = concatenate_datasets(split_datasets)
+        else:
+            dataset = dataset_dict
+
+        self._all_dataset_cache[cache_key] = dataset
+        return dataset
+
+    def _metadata_class_values(self, dataset):
+        if "label_folder" in dataset.column_names:
+            values = dataset["label_folder"]
+        else:
+            values = dataset["label"]
+            label_feature = getattr(dataset, "features", {}).get("label")
+            label_names = getattr(label_feature, "names", None)
+            if label_names:
+                values = [
+                    label_names[int(value)]
+                    if isinstance(value, (int, np.integer))
+                    and 0 <= int(value) < len(label_names)
+                    else value
+                    for value in values
+                ]
+        return [str(value) for value in values]
+
+    def _metadata_subject_values(self, dataset):
+        if "subject" not in dataset.column_names:
+            raise RuntimeError(
+                "Self-splitting the Hugging Face EEG dataset requires a "
+                "`subject` column."
+            )
+        return [str(value) for value in dataset["subject"]]
+
+    def _split_subject_targets(self, num_subjects):
+        """Return deterministic subject counts with nonempty splits."""
+        if num_subjects < 3:
+            raise RuntimeError(
+                "Self-splitting requires at least 3 unique subjects, "
+                f"got {num_subjects}"
+            )
+
+        ratios = self.split_ratios
+        raw_targets = ratios * num_subjects
+        targets = np.floor(raw_targets).astype(int)
+        targets[targets == 0] = 1
+        while targets.sum() > num_subjects:
+            removable = np.where(targets > 1)[0]
+            index = int(removable[np.argmax(targets[removable])])
+            targets[index] -= 1
+        fractions = raw_targets - np.floor(raw_targets)
+        while targets.sum() < num_subjects:
+            index = int(np.argmax(fractions))
+            targets[index] += 1
+            fractions[index] = -1.0
+        return targets
+
+    def _assign_subjects_to_splits(self, dataset):
+        """Assign each subject once while approximately balancing class counts."""
+        class_values = self._metadata_class_values(dataset)
+        subjects = self._metadata_subject_values(dataset)
+        class_names = list(self.class_names)
+        class_to_index = {name: index for index, name in enumerate(class_names)}
+
+        subject_class_counts = {}
+        for class_name, subject in zip(class_values, subjects):
+            if class_name not in class_to_index:
+                continue
+            if subject not in subject_class_counts:
+                subject_class_counts[subject] = np.zeros(len(class_names), dtype=np.float64)
+            subject_class_counts[subject][class_to_index[class_name]] += 1.0
+
+        subject_names = list(subject_class_counts)
+        if len(subject_names) < 3:
+            raise RuntimeError(
+                "Self-splitting requires at least 3 unique subjects, "
+                f"got {len(subject_names)}"
+            )
+
+        rng = np.random.default_rng(self.split_seed)
+        rng.shuffle(subject_names)
+        subject_names.sort(
+            key=lambda subject: float(subject_class_counts[subject].sum()),
+            reverse=True,
+        )
+
+        split_names = ("train", "val", "test")
+        subject_targets = self._split_subject_targets(len(subject_names))
+        all_class_counts = np.sum(
+            np.stack(list(subject_class_counts.values())), axis=0
+        )
+        sample_targets = all_class_counts[None, :] * np.asarray(
+            self.split_ratios, dtype=np.float64
+        )[:, None]
+        assigned_subjects = [[] for _ in split_names]
+        current_subject_counts = np.zeros(3, dtype=np.float64)
+        current_class_counts = np.zeros((3, len(class_names)), dtype=np.float64)
+
+        for subject in subject_names:
+            subject_counts = subject_class_counts[subject]
+            candidates = [
+                index
+                for index in range(3)
+                if current_subject_counts[index] < subject_targets[index]
+            ]
+            if not candidates:
+                candidates = list(range(3))
+
+            scores = []
+            for index in candidates:
+                proposed = current_class_counts[index] + subject_counts
+                class_error = np.sum(
+                    ((proposed - sample_targets[index]) / np.maximum(sample_targets[index], 1.0)) ** 2
+                )
+                sample_error = (
+                    (current_class_counts[index].sum() + subject_counts.sum())
+                    / max(sample_targets[index].sum(), 1.0)
+                    - 1.0
+                ) ** 2
+                subject_error = (
+                    (current_subject_counts[index] + 1.0)
+                    / max(float(subject_targets[index]), 1.0)
+                    - 1.0
+                ) ** 2
+                scores.append(class_error + 0.10 * sample_error + 0.25 * subject_error)
+
+            # Randomized candidate order makes equal-score assignments depend
+            # only on the requested seed, while ``argmin`` remains deterministic.
+            candidate_order = rng.permutation(len(candidates))
+            best_position = min(
+                candidate_order,
+                key=lambda position: scores[int(position)],
+            )
+            selected_split = candidates[int(best_position)]
+            assigned_subjects[selected_split].append(subject)
+            current_subject_counts[selected_split] += 1
+            current_class_counts[selected_split] += subject_counts
+
+        subject_to_split = {
+            subject: split_names[index]
+            for index, split_subjects in enumerate(assigned_subjects)
+            for subject in split_subjects
+        }
+        missing_classes = {
+            split_names[index]: [
+                class_names[class_index]
+                for class_index, count in enumerate(current_class_counts[index])
+                if count <= 0
+            ]
+            for index in range(3)
+            if np.any(current_class_counts[index] <= 0)
+        }
+        if missing_classes:
+            warnings.warn(
+                "Self split could not place every class in every split because "
+                "the class/subject support is insufficient: "
+                f"{missing_classes}"
+            )
+        sample_split_names = [subject_to_split[subject] for subject in subjects]
+        return sample_split_names, assigned_subjects, current_class_counts
+
+    def _load_custom_split(self, flag):
+        cache_key = (
+            self.dataset_id,
+            self.cache_dir,
+            self.split_seed,
+            tuple(np.round(self.split_ratios, 8)),
+            tuple(self.class_names),
+        )
+        cached = self._custom_split_cache.get(cache_key)
+        if cached is None:
+            all_dataset = self._load_all_dataset()
+            if self.max_classes:
+                class_values = self._metadata_class_values(all_dataset)
+                allowed_classes = set(self.class_names)
+                keep_indices = [
+                    index
+                    for index, class_name in enumerate(class_values)
+                    if class_name in allowed_classes
+                ]
+                all_dataset = all_dataset.select(keep_indices)
+
+            sample_split_names, _assigned_subjects, _class_counts = self._assign_subjects_to_splits(
+                all_dataset
+            )
+            cached = {
+                split_name: all_dataset.select(
+                    [
+                        index
+                        for index, assigned_split in enumerate(sample_split_names)
+                        if assigned_split == split_name
+                    ]
+                )
+                for split_name in ("train", "val", "test")
+            }
+            self._custom_split_cache[cache_key] = cached
+
+        split_key = {
+            "TRAIN": "train",
+            "VAL": "val",
+            "VALIDATION": "val",
+            "TEST": "test",
+        }[str(flag).upper()]
+        return cached[split_key]
+
     def _resolve_class_names(self):
-        cache_key = (self.dataset_id, self.cache_dir, self.max_classes)
+        cache_key = (
+            self.dataset_id,
+            self.cache_dir,
+            self.max_classes,
+            self.split_mode,
+        )
         cached = self._class_name_cache.get(cache_key)
         if cached is not None:
             return cached
 
-        reference_split = self._load_split("train")
+        reference_split = (
+            self._load_all_dataset()
+            if self.split_mode == "self"
+            else self._load_split("train")
+        )
         if "label_folder" in reference_split.column_names:
             class_names = natsorted(
                 {str(class_name) for class_name in reference_split["label_folder"]}

@@ -46,6 +46,11 @@ def build_stage1_full_setting(args):
         f"_afs_{args.stage1_arcface_s}_afm_{args.stage1_arcface_m}"
         f"_cfs_{args.stage1_cosface_s}_cfm_{args.stage1_cosface_m}"
         f"_eegnorm_{int(args.eeg_normalize)}_eegcls_{args.eeg_num_classes}"
+        f"_hfsplit_{getattr(args, 'eeg_hf_split_mode', 'original')}"
+        f"_hfseed_{getattr(args, 'eeg_hf_split_seed', args.seed)}"
+        f"_hfratio_{getattr(args, 'eeg_hf_train_ratio', 0.6)}"
+        f"_{getattr(args, 'eeg_hf_val_ratio', 0.2)}"
+        f"_{getattr(args, 'eeg_hf_test_ratio', 0.2)}"
     )
     if args.model == "DA4FE":
         setting += (
@@ -108,6 +113,11 @@ if __name__ == "__main__":
     parser.add_argument("--data_path", type=str, default="EEG-ImageNet", help="data file")
     parser.add_argument("--eeg_hf_dataset_id", type=str, default="luigi-s/EEG_Image_CVPR_ALL_subj")
     parser.add_argument("--eeg_hf_cache_dir", type=str_or_none, default=None)
+    parser.add_argument("--eeg_hf_split_mode", "--eeg-hf-split-mode", type=str, choices=["original", "self"], default="original", help="Hugging Face split mode: original uses native splits; self merges all rows and splits by subject with class balancing")
+    parser.add_argument("--eeg_hf_split_seed", "--eeg-hf-split-seed", type=int, default=None, help="random seed for self split; defaults to --seed")
+    parser.add_argument("--eeg_hf_train_ratio", "--eeg-hf-train-ratio", type=float, default=0.6, help="self split train ratio; three HF self split ratios must sum to 1")
+    parser.add_argument("--eeg_hf_val_ratio", "--eeg-hf-val-ratio", type=float, default=0.2, help="self split validation ratio; three HF self split ratios must sum to 1")
+    parser.add_argument("--eeg_hf_test_ratio", "--eeg-hf-test-ratio", type=float, default=0.2, help="self split test ratio; three HF self split ratios must sum to 1")
     parser.add_argument("--seq_len", type=int, default=512, help="input sequence length")
     parser.add_argument("--sampling_rate", type=float, default=1000.0, help="EEG sampling rate in Hz for the DA4FE frequency branch")
     parser.add_argument("--frequency_window", type=str, default="hann", choices=["hann", "rectangular"], help="window used before rFFT in the DA4FE frequency branch")
@@ -150,6 +160,7 @@ if __name__ == "__main__":
     parser.add_argument("--patience", type=int, default=500)
     parser.add_argument("--learning_rate", type=float, default=2e-4)
     parser.add_argument("--stage1_weight_decay", "--stage1-weight-decay", type=float, default=1e-4, help="AdamW weight decay for Stage-1 training")
+    parser.add_argument("--seed", type=int, default=42, help="random seed for training and Hugging Face self split")
 
     # Stage-1 loss and metric-learning configuration.
     parser.add_argument("--stage1_loss", type=str, default="ce_multi_similarity", choices=["triplet", "ce", "ce_triplet", "multi_similarity", "ce_multi_similarity", "arcface", "arcface_triplet", "cosface", "cosface_triplet"], help="stage1 loss type")
@@ -201,6 +212,12 @@ if __name__ == "__main__":
         )
     if args.stage1_weight_decay < 0:
         parser.error("--stage1_weight_decay must be non-negative")
+    split_ratios = np.asarray(
+        [args.eeg_hf_train_ratio, args.eeg_hf_val_ratio, args.eeg_hf_test_ratio],
+        dtype=np.float64,
+    )
+    if np.any(split_ratios <= 0) or not np.isclose(split_ratios.sum(), 1.0, atol=1e-6):
+        parser.error("--eeg_hf_train_ratio, --eeg_hf_val_ratio and --eeg_hf_test_ratio must be positive and sum to 1.0")
     if args.result_dir is None:
         args.result_dir = str(Path(__file__).resolve().parent.parent / "result")
     args.requested_seq_len = args.seq_len
@@ -218,8 +235,10 @@ if __name__ == "__main__":
     Exp = Exp_Stage1_Feature
     test_kmeans_scores = []
 
+    base_seed = args.seed
+    explicit_hf_split_seed = args.eeg_hf_split_seed
     for ii in range(args.itr):
-        seed = 42 + ii
+        seed = base_seed + ii
         random.seed(seed)
         os.environ["PYTHONHASHSEED"] = str(seed)
         np.random.seed(seed)
@@ -231,6 +250,9 @@ if __name__ == "__main__":
             torch.backends.cudnn.deterministic = True
 
         args.seed = seed
+        args.eeg_hf_split_seed = (
+            explicit_hf_split_seed if explicit_hf_split_seed is not None else seed
+        )
         args.full_setting_name = build_stage1_full_setting(args)
         args.run_started_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         setting = build_run_directory_name(args, stage_name="stage1")

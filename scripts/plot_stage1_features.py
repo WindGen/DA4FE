@@ -61,6 +61,11 @@ DEFAULT_ARGS: dict[str, Any] = {
     "data_path": "EEG-ImageNet",
     "eeg_hf_dataset_id": "luigi-s/EEG_Image_CVPR_ALL_subj",
     "eeg_hf_cache_dir": None,
+    "eeg_hf_split_mode": "original",
+    "eeg_hf_split_seed": None,
+    "eeg_hf_train_ratio": 0.6,
+    "eeg_hf_val_ratio": 0.2,
+    "eeg_hf_test_ratio": 0.2,
     # DA4FE's frequency branch requires these fields.  They are overwritten
     # by run_params.json/checkpoint args for newer runs, and provide a safe
     # fallback for older checkpoints whose metadata did not record them.
@@ -197,6 +202,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-path", "--data_path", dest="data_path", default=None)
     parser.add_argument("--eeg-hf-dataset-id", dest="eeg_hf_dataset_id", default=None)
     parser.add_argument("--eeg-hf-cache-dir", dest="eeg_hf_cache_dir", default=None)
+    parser.add_argument("--eeg-hf-split-mode", "--eeg_hf_split_mode", dest="eeg_hf_split_mode", choices=("original", "self"), default=None)
+    parser.add_argument("--eeg-hf-split-seed", "--eeg_hf_split_seed", dest="eeg_hf_split_seed", type=int, default=None)
+    parser.add_argument("--eeg-hf-train-ratio", "--eeg_hf_train_ratio", dest="eeg_hf_train_ratio", type=float, default=None)
+    parser.add_argument("--eeg-hf-val-ratio", "--eeg_hf_val_ratio", dest="eeg_hf_val_ratio", type=float, default=None)
+    parser.add_argument("--eeg-hf-test-ratio", "--eeg_hf_test_ratio", dest="eeg_hf_test_ratio", type=float, default=None)
     parser.add_argument("--seq-len", "--seq_len", dest="seq_len", type=int, default=None)
     parser.add_argument(
         "--sampling-rate",
@@ -331,6 +341,11 @@ def build_runtime_args(
         "data_path": cli.data_path,
         "eeg_hf_dataset_id": cli.eeg_hf_dataset_id,
         "eeg_hf_cache_dir": cli.eeg_hf_cache_dir,
+        "eeg_hf_split_mode": cli.eeg_hf_split_mode,
+        "eeg_hf_split_seed": cli.eeg_hf_split_seed,
+        "eeg_hf_train_ratio": cli.eeg_hf_train_ratio,
+        "eeg_hf_val_ratio": cli.eeg_hf_val_ratio,
+        "eeg_hf_test_ratio": cli.eeg_hf_test_ratio,
         "seq_len": cli.seq_len,
         "sampling_rate": cli.sampling_rate,
         "stage1_l2_normalize": cli.stage1_l2_normalize,
