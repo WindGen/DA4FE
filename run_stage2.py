@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 from datetime import datetime
 from pathlib import Path
@@ -9,6 +10,77 @@ import psutil
 import torch
 
 from exp.exp_stage2_classifier import Exp_Stage2_Classifier
+
+
+STAGE1_PARAM_KEYS = (
+    "model",
+    "data",
+    "root_path",
+    "data_path",
+    "eeg_hf_dataset_id",
+    "eeg_hf_cache_dir",
+    "eeg_hf_split_mode",
+    "eeg_hf_split_seed",
+    "eeg_hf_train_ratio",
+    "eeg_hf_val_ratio",
+    "eeg_hf_test_ratio",
+    "seq_len",
+    "requested_seq_len",
+    "sampling_rate",
+    "frequency_window",
+    "frequency_normalization",
+    "patch_len",
+    "enc_in",
+    "d_model",
+    "n_heads",
+    "t_layer",
+    "v_layer",
+    "f_layer",
+    "da4fe_channel_dim",
+    "da4fe_temporal_dim",
+    "da4fe_frequency_dim",
+    "da4fe_fusion_mode",
+    "da4fe_fusion_hidden_dim",
+    "da4fe_fusion_out_dim",
+    "da4fe_channel_weight",
+    "da4fe_temporal_weight",
+    "da4fe_frequency_weight",
+    "dropout",
+    "augmentations",
+    "eeg_normalize",
+    "eeg_num_classes",
+    "eeg_adaptive_seq_len",
+    "stage1_l2_normalize",
+    "seed",
+)
+
+
+def load_stage1_run_params(path):
+    path = Path(path).expanduser()
+    if path.is_dir():
+        path = path / "run_params.json"
+    if not path.exists():
+        raise FileNotFoundError(f"Stage-1 run_params.json not found: {path}")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"Expected a JSON object in {path}")
+    saved_args = payload.get("args", payload)
+    if not isinstance(saved_args, dict):
+        raise ValueError(f"Expected an args object in {path}")
+    return path, saved_args
+
+
+def apply_stage1_run_params(args, path):
+    path, saved_args = load_stage1_run_params(path)
+    applied = []
+    for key in STAGE1_PARAM_KEYS:
+        if key in saved_args and saved_args[key] is not None:
+            setattr(args, key, saved_args[key])
+            applied.append(key)
+    args.run_params_path = str(path)
+    print(f"Loaded Stage-1 model/data parameters: {path}")
+    print(f"Applied parameters: {', '.join(applied)}")
+    return args
 
 
 def str2bool(value):
@@ -89,6 +161,12 @@ if __name__ == "__main__":
     parser.add_argument("--data_path", type=str, default="EEG-ImageNet", help="data file")
     parser.add_argument("--eeg_hf_dataset_id", type=str, default="luigi-s/EEG_Image_CVPR_ALL_subj")
     parser.add_argument("--eeg_hf_cache_dir", type=str_or_none, default=None)
+    parser.add_argument("--run_params", "--run-params", type=str_or_none, default=None, help="Stage-1 run_params.json or its run directory; when provided, model/data parameters are loaded automatically")
+    parser.add_argument("--eeg_hf_split_mode", "--eeg-hf-split-mode", type=str, choices=["original", "self"], default="original", help="Hugging Face split mode when run_params is not provided")
+    parser.add_argument("--eeg_hf_split_seed", "--eeg-hf-split-seed", type=int, default=None, help="random seed for the Hugging Face self split")
+    parser.add_argument("--eeg_hf_train_ratio", "--eeg-hf-train-ratio", type=float, default=0.6, help="self split train ratio")
+    parser.add_argument("--eeg_hf_val_ratio", "--eeg-hf-val-ratio", type=float, default=0.2, help="self split validation ratio")
+    parser.add_argument("--eeg_hf_test_ratio", "--eeg-hf-test-ratio", type=float, default=0.2, help="self split test ratio")
 
     parser.add_argument("--seq_len", type=int, default=512, help="input sequence length")
     parser.add_argument(
@@ -172,6 +250,7 @@ if __name__ == "__main__":
     parser.add_argument("--stage2_mlp_alpha", type=float, default=1e-4)
     parser.add_argument("--stage2_mlp_lr", type=float, default=1e-3)
     parser.add_argument("--stage2_max_iter", type=int, default=1000)
+    parser.add_argument("--seed", type=int, default=42, help="random seed; run_params value is used when run_params is provided")
 
     parser.add_argument("--gpu_idx", nargs="+", type=int, default=[0, 1, 2, 3, 4, 5, 6, 7])
     parser.add_argument("--use_gpu", type=str2bool, default=True)
@@ -180,6 +259,8 @@ if __name__ == "__main__":
     parser.add_argument("--devices", type=str, default="0,1,2,3")
 
     args = parser.parse_args()
+    if args.run_params is not None:
+        args = apply_stage1_run_params(args, args.run_params)
     effective_f_layer = (
         args.f_layer if args.f_layer is not None else args.t_layer
     )
@@ -192,9 +273,18 @@ if __name__ == "__main__":
             "--sampling_rate must be a positive value when "
             "DA4FE frequency branch is enabled"
         )
+    split_ratios = np.asarray(
+        [args.eeg_hf_train_ratio, args.eeg_hf_val_ratio, args.eeg_hf_test_ratio],
+        dtype=np.float64,
+    )
+    if np.any(split_ratios <= 0) or not np.isclose(split_ratios.sum(), 1.0, atol=1e-6):
+        parser.error("--eeg_hf_train_ratio, --eeg_hf_val_ratio and --eeg_hf_test_ratio must be positive and sum to 1.0")
     if args.result_dir is None:
         args.result_dir = str(Path(__file__).resolve().parent.parent / "result")
-    args.requested_seq_len = args.seq_len
+    if getattr(args, "requested_seq_len", None) in (None, 0):
+        args.requested_seq_len = args.seq_len
+    if args.eeg_hf_split_seed is None:
+        args.eeg_hf_split_seed = args.seed
     args.use_gpu = True if torch.cuda.is_available() and args.use_gpu else False
 
     if args.use_gpu and args.use_multi_gpu:
@@ -206,7 +296,7 @@ if __name__ == "__main__":
     active_gpus = args.gpu_idx if args.use_multi_gpu else [args.gpu]
     use_cpus(gpus=active_gpus, cpus_per_gpu=12)
 
-    seed = 42
+    seed = args.seed
     random.seed(seed)
     os.environ["PYTHONHASHSEED"] = str(seed)
     np.random.seed(seed)

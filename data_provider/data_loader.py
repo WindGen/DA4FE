@@ -1,4 +1,5 @@
 import copy
+import io
 import os
 import numpy as np
 import pandas as pd
@@ -11,9 +12,15 @@ from torch.utils.data import Dataset, DataLoader
 from data_provider.uea import (normalize_batch_ts,bandpass_filter_func)
 import warnings
 import random
+import urllib.request
 from sklearn.utils import shuffle
 from sklearn.model_selection import train_test_split
 from natsort import natsorted
+
+try:
+    from PIL import Image
+except ImportError:  # pragma: no cover - only required by Stage-3 generation
+    Image = None
 
 try:
     from datasets import DatasetDict, concatenate_datasets, load_dataset
@@ -713,6 +720,7 @@ class EEGImageNetHuggingFaceLoader(Dataset):
         else:
             raw_dataset = self._load_split(self.split_name)
         self.dataset = self._prepare_dataset(raw_dataset)
+        self.image_column = self._resolve_image_column(self.dataset)
         self.max_seq_len, self.feature_dim = self._resolve_dataset_metadata()
         class_column = (
             self.dataset["label_folder"]
@@ -1052,6 +1060,7 @@ class EEGImageNetHuggingFaceLoader(Dataset):
             dataset = dataset.select(keep_indices)
 
         keep_columns = {"conditioning_image", "label", "subject", "label_folder"}
+        keep_columns.update(self._image_related_columns(dataset))
         drop_columns = [
             column_name
             for column_name in dataset.column_names
@@ -1060,6 +1069,120 @@ class EEGImageNetHuggingFaceLoader(Dataset):
         if drop_columns:
             dataset = dataset.remove_columns(drop_columns)
         return dataset
+
+    @staticmethod
+    def _resolve_image_column(dataset, required=False):
+        """Find the paired image column without assuming one HF feature name.
+
+        The public EEG-ImageNet releases have used ``image``, ``image_raw`` and
+        path-like names in different revisions.  We intentionally do not use a
+        local image root or reconstruct an image from a class label: generation
+        training requires the exact image paired with each EEG sample.
+        """
+        columns = list(getattr(dataset, "column_names", []))
+        preferred = (
+            "image",
+            "image_raw",
+            "target_image",
+            "image_path",
+            "image_filename",
+            "image_file",
+            "image_url",
+        )
+        for name in preferred:
+            if name in columns:
+                return name
+        for name in columns:
+            lower = str(name).lower()
+            if lower in {"conditioning_image", "eeg", "eeg_signal", "signal"}:
+                continue
+            if "image" in lower or lower.endswith(("_jpg", "_jpeg", "_png")):
+                return name
+        if required:
+            raise RuntimeError(
+                "Hugging Face dataset does not contain an image field. "
+                "Exact EEG-image generation requires paired image data."
+            )
+        return None
+
+    @staticmethod
+    def _image_related_columns(dataset):
+        columns = list(getattr(dataset, "column_names", []))
+        return [
+            name
+            for name in columns
+            if str(name).lower() not in {"conditioning_image", "eeg", "eeg_signal", "signal"}
+            and (
+                "image" in str(name).lower()
+                or str(name).lower().endswith(("_jpg", "_jpeg", "_png"))
+            )
+        ]
+
+    @staticmethod
+    def _to_pil_image(value):
+        """Convert common Hugging Face image feature representations to PIL."""
+        if Image is None:
+            raise ImportError(
+                "Pillow is required for Stage-3 image generation; install Pillow."
+            )
+        if isinstance(value, Image.Image):
+            return value.convert("RGB")
+        if isinstance(value, dict):
+            if value.get("bytes") is not None:
+                return Image.open(io.BytesIO(value["bytes"])).convert("RGB")
+            if value.get("path"):
+                return Image.open(value["path"]).convert("RGB")
+        if isinstance(value, (bytes, bytearray, memoryview)):
+            return Image.open(io.BytesIO(bytes(value))).convert("RGB")
+        if isinstance(value, torch.Tensor):
+            value = value.detach().cpu().numpy()
+        if isinstance(value, (list, tuple)):
+            value = np.asarray(value)
+        if isinstance(value, np.ndarray):
+            array = value
+            if array.ndim == 3 and array.shape[0] in (1, 3, 4) and array.shape[-1] not in (1, 3, 4):
+                array = np.moveaxis(array, 0, -1)
+            if array.dtype != np.uint8:
+                array = np.clip(array, 0.0, 1.0) * 255.0 if array.max() <= 1.0 else np.clip(array, 0.0, 255.0)
+                array = array.astype(np.uint8)
+            return Image.fromarray(array).convert("RGB")
+        if isinstance(value, (str, os.PathLike)):
+            value = os.fspath(value)
+            if str(value).lower().startswith(("http://", "https://")):
+                with urllib.request.urlopen(value, timeout=30) as response:
+                    return Image.open(io.BytesIO(response.read())).convert("RGB")
+            return Image.open(value).convert("RGB")
+        raise TypeError(f"Unsupported Hugging Face image value type: {type(value)!r}")
+
+    def get_image(self, index):
+        """Return the paired image for a sample as an RGB PIL image."""
+        if self.image_column is None:
+            self.image_column = self._resolve_image_column(self.dataset, required=True)
+        sample = self.dataset[index]
+        errors = []
+        for column_name in [self.image_column] + [
+            name for name in self._image_related_columns(self.dataset)
+            if name != self.image_column
+        ]:
+            if column_name not in sample:
+                continue
+            try:
+                return self._to_pil_image(sample[column_name])
+            except (OSError, TypeError, ValueError) as exc:
+                errors.append(f"{column_name}: {exc}")
+        raise RuntimeError(
+            f"Could not decode a paired image for Hugging Face sample {index}. "
+            "Expected a PIL image, encoded bytes, image path or URL. "
+            f"Tried columns: {errors}"
+        )
+
+    def get_subject(self, index):
+        sample = self.dataset[index]
+        return str(sample.get("subject", "unknown"))
+
+    def get_label_name(self, index):
+        sample = self.dataset[index]
+        return self._sample_class_name(sample)
 
     def _time_first_shape(self, shape):
         if shape[0] < shape[1]:
