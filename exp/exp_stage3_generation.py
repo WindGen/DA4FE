@@ -1,5 +1,6 @@
 """DreamDiffusion-style image generation conditioned on DA4FE EEG features."""
 
+import csv
 import json
 import math
 import random
@@ -135,9 +136,13 @@ class Exp_Stage3_Generation:
             candidates = sorted(list(root.glob("*.safetensors")) + list(root.glob("*.ckpt"))) if root.is_dir() else []
             if len(candidates) == 1:
                 path = candidates[0]
-        if not path.exists():
-            raise FileNotFoundError(f"Pretrained model path does not exist: {path}. Prepare local weights under --pretrained_root.")
-        return path
+        if path.exists():
+            return path
+        if self.args.allow_hf_download:
+            if explicit is not None and "/" in str(explicit).replace("\\", "/"):
+                return str(explicit)
+            return "runwayml/stable-diffusion-v1-5" if default_name.startswith("stable-diffusion") else "openai/clip-vit-large-patch14"
+        raise FileNotFoundError(f"Pretrained model path does not exist: {path}. Set --allow_hf_download true to download from Hugging Face.")
 
     def _build_diffusion_models(self):
         try:
@@ -145,7 +150,9 @@ class Exp_Stage3_Generation:
         except ImportError as exc:
             raise ImportError("Stage-3 requires diffusers>=0.27.0. Install requirements.txt before training.") from exc
         sd_path = self._resolve_pretrained_path(self.args.sd_model_path, "stable-diffusion-v1-5")
-        if sd_path.is_file() and hasattr(StableDiffusionPipeline, "from_single_file"):
+        if isinstance(sd_path, str):
+            pipeline = StableDiffusionPipeline.from_pretrained(str(sd_path), cache_dir=self.args.hf_cache_dir, local_files_only=not self.args.allow_hf_download, safety_checker=None)
+        elif sd_path.is_file() and hasattr(StableDiffusionPipeline, "from_single_file"):
             pipeline = StableDiffusionPipeline.from_single_file(str(sd_path), local_files_only=True, safety_checker=None)
         elif sd_path.is_dir():
             pipeline = StableDiffusionPipeline.from_pretrained(str(sd_path), local_files_only=True, safety_checker=None)
@@ -178,7 +185,7 @@ class Exp_Stage3_Generation:
             except ImportError as exc:
                 raise ImportError("CLIP loss requires transformers>=4.40.0") from exc
             clip_path = self._resolve_pretrained_path(self.args.clip_model_path, "clip-vit-large-patch14")
-            self.clip_model = CLIPVisionModelWithProjection.from_pretrained(str(clip_path), local_files_only=True).to(self.device).eval()
+            self.clip_model = CLIPVisionModelWithProjection.from_pretrained(str(clip_path), cache_dir=self.args.hf_cache_dir, local_files_only=not self.args.allow_hf_download).to(self.device).eval()
             for parameter in self.clip_model.parameters():
                 parameter.requires_grad = False
         params = [{"params": list(self.condition_adapter.parameters()) + self.trainable_unet_parameters, "lr": self.args.generation_lr}]
@@ -248,20 +255,23 @@ class Exp_Stage3_Generation:
         path = self.output_dir / "checkpoint.pth"
         trainable_names = {name for name, parameter in self.unet.named_parameters() if parameter.requires_grad}
         unet_state = {name: value.detach().cpu() for name, value in self.unet.state_dict().items() if name in trainable_names}
-        torch.save({"epoch": epoch, "metrics": metrics, "condition_adapter": self.condition_adapter.state_dict(), "unet_trainable": unet_state, "optimizer": self.optimizer.state_dict(), "stage1_checkpoint": str(self.stage1_checkpoint_path)}, path)
+        stage1_state = self.stage1_model.state_dict() if self.args.generation_stage1_lr > 0 else None
+        torch.save({"epoch": epoch, "metrics": metrics, "condition_adapter": self.condition_adapter.state_dict(), "unet_trainable": unet_state, "stage1_model": stage1_state, "optimizer": self.optimizer.state_dict(), "stage1_checkpoint": str(self.stage1_checkpoint_path)}, path)
         return path
 
     def train(self):
         best = math.inf
         history = []
-        for epoch in range(1, self.args.generation_epochs + 1):
+        epoch_progress = tqdm(range(1, self.args.generation_epochs + 1), desc="Stage-3 total", unit="epoch", position=0, dynamic_ncols=True)
+        for epoch in epoch_progress:
             self.stage1_model.train(self.args.generation_stage1_lr > 0)
             self.condition_adapter.train()
             self.unet.train(self.args.generation_train_unet)
             totals = np.zeros(3, dtype=np.float64)
             count = 0
             start = time.time()
-            for batch in tqdm(self._loader(self.train_data, train=True), desc=f"Stage-3 epoch {epoch}/{self.args.generation_epochs}", leave=False):
+            batch_progress = tqdm(self._loader(self.train_data, train=True), desc=f"Epoch {epoch}/{self.args.generation_epochs}", unit="batch", position=1, leave=False, dynamic_ncols=True)
+            for batch in batch_progress:
                 self.optimizer.zero_grad(set_to_none=True)
                 value, diffusion_value, clip_value = self._loss_for_batch(batch)
                 value.backward()
@@ -270,14 +280,17 @@ class Exp_Stage3_Generation:
                 size = batch["eeg"].shape[0]
                 totals += np.asarray([float(value), float(diffusion_value), float(clip_value)]) * size
                 count += size
+                batch_progress.set_postfix(loss=f"{float(value):.4f}", refresh=False)
             train_metrics = {"loss": totals[0] / max(count, 1), "diffusion_loss": totals[1] / max(count, 1), "clip_loss": totals[2] / max(count, 1)}
             val_metrics = self._evaluate(self.val_data, "val")
             row = {"epoch": epoch, "train": train_metrics, "val": val_metrics, "epoch_time_sec": time.time() - start}
             history.append(row)
+            epoch_progress.set_postfix(train_loss=f"{train_metrics['loss']:.4f}", val_loss=f"{val_metrics['loss']:.4f}", refresh=True)
             print(f"Epoch {epoch}: train_loss={train_metrics['loss']:.6f}, val_loss={val_metrics['loss']:.6f}")
             if val_metrics["loss"] < best:
                 best = val_metrics["loss"]
                 self._save_checkpoint(epoch, row)
+        epoch_progress.close()
         with (self.output_dir / "metrics.json").open("w", encoding="utf-8") as handle:
             json.dump(history, handle, ensure_ascii=False, indent=2)
         return history
@@ -286,6 +299,11 @@ class Exp_Stage3_Generation:
         images = self.vae.decode(latents / self.vae.config.scaling_factor).sample
         images = ((images.clamp(-1, 1) + 1.0) * 127.5).round().byte().permute(0, 2, 3, 1).cpu().numpy()
         return [Image.fromarray(image) for image in images]
+
+    @staticmethod
+    def _tensor_to_pil(image):
+        image = ((image.detach().cpu().clamp(-1, 1) + 1.0) * 127.5).round().byte()
+        return Image.fromarray(image.permute(1, 2, 0).numpy())
 
     def _sample_batch(self, eeg):
         features = self._features(eeg)
@@ -304,15 +322,32 @@ class Exp_Stage3_Generation:
         self.stage1_model.eval()
         self.condition_adapter.eval()
         self.unet.eval()
-        saved = 0
+        saved_items = 0
+        manifest_rows = []
         with torch.no_grad():
             for batch in tqdm(self._loader(dataset, train=False), desc=f"Sampling {split}"):
                 eeg = batch["eeg"].to(self.device).float()
                 for sample_index in range(self.args.generation_num_samples):
                     images = self._sample_batch(eeg)
                     for item_index, image in enumerate(images):
-                        image.save(root / f"{saved:06d}_sample{sample_index}.png")
-                        saved += 1
-                if self.args.generation_eval_items > 0 and saved >= self.args.generation_eval_items * self.args.generation_num_samples:
+                        if sample_index == 0:
+                            sample_id = f"{saved_items + item_index:06d}"
+                            real_name = f"{sample_id}_0.png"
+                            self._tensor_to_pil(batch["image"][item_index]).save(root / real_name)
+                            manifest_rows.append({"sample_id": sample_id, "real_image": real_name, "subject": batch["subject"][item_index], "label": batch["label_name"][item_index]})
+                        else:
+                            sample_id = f"{saved_items + item_index:06d}"
+                        generated_name = f"{sample_id}_{sample_index + 1}.png"
+                        image.save(root / generated_name)
+                        manifest_rows[saved_items + item_index][f"generated_{sample_index + 1}"] = generated_name
+                    if sample_index == self.args.generation_num_samples - 1:
+                        saved_items += len(images)
+                if self.args.generation_eval_items > 0 and saved_items >= self.args.generation_eval_items:
                     break
-        print(f"Saved {saved} generated images to {root}")
+        manifest_path = root / "manifest.csv"
+        fieldnames = ["sample_id", "real_image", "subject", "label"] + [f"generated_{index}" for index in range(1, self.args.generation_num_samples + 1)]
+        with manifest_path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(manifest_rows)
+        print(f"Saved {saved_items} real/generated image groups to {root}")

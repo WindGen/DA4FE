@@ -335,23 +335,24 @@ def build_runtime_args(
     values = dict(DEFAULT_ARGS)
     values.update(saved_args)
 
+    cli_value = lambda name, default=None: getattr(cli, name, default)
     overrides = {
-        "data": cli.data,
-        "root_path": cli.root_path,
-        "data_path": cli.data_path,
-        "eeg_hf_dataset_id": cli.eeg_hf_dataset_id,
-        "eeg_hf_cache_dir": cli.eeg_hf_cache_dir,
-        "eeg_hf_split_mode": cli.eeg_hf_split_mode,
-        "eeg_hf_split_seed": cli.eeg_hf_split_seed,
-        "eeg_hf_train_ratio": cli.eeg_hf_train_ratio,
-        "eeg_hf_val_ratio": cli.eeg_hf_val_ratio,
-        "eeg_hf_test_ratio": cli.eeg_hf_test_ratio,
-        "seq_len": cli.seq_len,
-        "sampling_rate": cli.sampling_rate,
-        "stage1_l2_normalize": cli.stage1_l2_normalize,
-        "batch_size": cli.batch_size,
-        "num_workers": cli.num_workers,
-        "seed": cli.seed,
+        "data": cli_value("data"),
+        "root_path": cli_value("root_path"),
+        "data_path": cli_value("data_path"),
+        "eeg_hf_dataset_id": cli_value("eeg_hf_dataset_id"),
+        "eeg_hf_cache_dir": cli_value("eeg_hf_cache_dir"),
+        "eeg_hf_split_mode": cli_value("eeg_hf_split_mode"),
+        "eeg_hf_split_seed": cli_value("eeg_hf_split_seed"),
+        "eeg_hf_train_ratio": cli_value("eeg_hf_train_ratio"),
+        "eeg_hf_val_ratio": cli_value("eeg_hf_val_ratio"),
+        "eeg_hf_test_ratio": cli_value("eeg_hf_test_ratio"),
+        "seq_len": cli_value("seq_len"),
+        "sampling_rate": cli_value("sampling_rate"),
+        "stage1_l2_normalize": cli_value("stage1_l2_normalize"),
+        "batch_size": cli_value("batch_size"),
+        "num_workers": cli_value("num_workers"),
+        "seed": cli_value("seed"),
     }
     for key, value in overrides.items():
         if value is not None:
@@ -422,13 +423,14 @@ def build_runtime_args(
     # The extractor uses a single device.  DataParallel prefixes are handled
     # by load_model_state, so there is no need to initialize multiple GPUs.
     requested_gpu = bool(values.get("use_gpu", False))
-    if cli.device == "cpu":
+    device = cli_value("device", "auto")
+    if device == "cpu":
         # Some containerized/virtual GPU runtimes crash even when only
         # torch.cuda.is_available() is queried.  Hide CUDA before any such
         # query so an explicit CPU request is genuinely CPU-only.
         os.environ["CUDA_VISIBLE_DEVICES"] = ""
         use_gpu = False
-    elif cli.device == "cuda":
+    elif device == "cuda":
         if not torch.cuda.is_available():
             raise RuntimeError("--device cuda was requested, but CUDA is unavailable")
         use_gpu = True

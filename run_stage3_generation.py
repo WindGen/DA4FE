@@ -32,13 +32,13 @@ def str_or_none(value):
 parser = argparse.ArgumentParser(description="DreamDiffusion-style Stage-3 EEG image generation")
 
 # DA4FE checkpoint and Hugging Face data configuration.
-parser.add_argument("--stage1_run_dir", type=str_or_none, default=None, help="DA4FE run directory containing run_params.json, split_summary.json and checkpoint.pth")  # DA4FE参数目录
+parser.add_argument("--stage1_run_dir", type=str_or_none, default="../result/DA4FE/stage1/20260918_144539", help="DA4FE run directory containing run_params.json, split_summary.json and checkpoint.pth")  # DA4FE参数目录
 parser.add_argument("--stage1_checkpoint", type=str_or_none, default=None, help="optional DA4FE checkpoint path; otherwise checkpoint.pth is read from --stage1_run_dir")  # DA4FE权重
 parser.add_argument("--stage1_run_params", type=str_or_none, default=None, help="optional run_params.json path; otherwise read from --stage1_run_dir")  # DA4FE参数文件
 parser.add_argument("--stage1_split_summary", type=str_or_none, default=None, help="optional split_summary.json path; otherwise read from --stage1_run_dir")  # 数据划分参数
 parser.add_argument("--eeg_hf_dataset_id", type=str_or_none, default=None, help="override Hugging Face dataset id from DA4FE run_params.json")  # HF数据集
 parser.add_argument("--eeg_hf_cache_dir", type=str_or_none, default=None, help="override Hugging Face cache directory")  # HF缓存目录
-parser.add_argument("--eeg_hf_split_mode", choices=["original", "self"], default=None, help="override original/self split mode from DA4FE run_params.json")  # HF划分方式
+parser.add_argument("--eeg_hf_split_mode", choices=["original", "self"], default="original", help="override original/self split mode from DA4FE run_params.json")  # HF划分方式
 parser.add_argument("--eeg_hf_split_seed", type=int, default=None, help="random seed for HF self split")  # HF划分随机种子
 parser.add_argument("--eeg_hf_train_ratio", type=float, default=None, help="train ratio for HF self split")  # HF训练比例
 parser.add_argument("--eeg_hf_val_ratio", type=float, default=None, help="validation ratio for HF self split")  # HF验证比例
@@ -48,6 +48,8 @@ parser.add_argument("--eeg_hf_test_ratio", type=float, default=None, help="test 
 parser.add_argument("--pretrained_root", type=str, default="../pretrained", help="directory containing stable-diffusion-v1-5 and clip-vit-large-patch14")  # 预训练权重根目录
 parser.add_argument("--sd_model_path", type=str_or_none, default=None, help="local Diffusers Stable Diffusion directory; defaults to pretrained_root/stable-diffusion-v1-5")  # Stable Diffusion权重
 parser.add_argument("--clip_model_path", type=str_or_none, default=None, help="local CLIP vision directory; defaults to pretrained_root/clip-vit-large-patch14")  # CLIP权重
+parser.add_argument("--hf_cache_dir", type=str_or_none, default=None, help="Hugging Face cache directory; None uses the system default cache")  # Hugging Face缓存目录
+parser.add_argument("--allow_hf_download", type=str2bool, default=True, help="read Hugging Face cache first and download missing files when enabled")  # 是否允许自动下载
 
 # EEG-to-diffusion condition adapter.
 parser.add_argument("--generation_context_tokens", type=int, default=4, help="number of EEG tokens passed to Stable Diffusion cross-attention")  # EEG条件token数
@@ -57,19 +59,19 @@ parser.add_argument("--generation_adapter_dropout", type=float, default=0.0, hel
 
 # Generation data and optimization parameters.
 parser.add_argument("--generation_image_size", type=int, default=512, help="square image resolution used by VAE and sampling")  # 图片尺寸
-parser.add_argument("--generation_epochs", type=int, default=50, help="number of Stage-3 training epochs")  # 训练轮数
-parser.add_argument("--generation_batch_size", type=int, default=2, help="Stage-3 batch size")  # 训练批大小
+parser.add_argument("--generation_epochs", type=int, default=80, help="number of Stage-3 training epochs")  # 训练轮数
+parser.add_argument("--generation_batch_size", type=int, default=4, help="Stage-3 batch size")  # 训练批大小
 parser.add_argument("--generation_lr", type=float, default=1e-4, help="learning rate for EEG condition adapter")  # 条件适配器学习率
 parser.add_argument("--generation_weight_decay", type=float, default=1e-2, help="AdamW weight decay")  # 权重衰减
-parser.add_argument("--generation_clip_weight", type=float, default=0.1, help="weight of optional CLIP image alignment loss; zero disables CLIP loading")  # CLIP损失权重
+parser.add_argument("--generation_clip_weight", type=float, default=0.2, help="weight of optional CLIP image alignment loss; zero disables CLIP loading")  # CLIP损失权重
 parser.add_argument("--generation_stage1_lr", type=float, default=0.0, help="learning rate for DA4FE; zero freezes the Stage-1 feature extractor")  # DA4FE微调学习率
-parser.add_argument("--generation_train_unet", type=str2bool, default=False, help="train Stable Diffusion cross-attention parameters in addition to the EEG adapter")  # 是否训练U-Net交叉注意力
+parser.add_argument("--generation_train_unet", type=str2bool, default=True, help="train Stable Diffusion cross-attention parameters in addition to the EEG adapter")  # 是否训练U-Net交叉注意力
 parser.add_argument("--generation_grad_clip", type=float, default=1.0, help="gradient clipping norm")  # 梯度裁剪
 
 # Evaluation and output parameters.
-parser.add_argument("--generation_num_inference_steps", type=int, default=30, help="diffusion sampling steps")  # 采样步数
-parser.add_argument("--generation_num_samples", type=int, default=4, help="number of generated images per EEG")  # 每条EEG生成图片数
-parser.add_argument("--generation_eval_items", type=int, default=32, help="maximum EEG items sampled per split; zero means all")  # 采样样本上限
+parser.add_argument("--generation_num_inference_steps", type=int, default=150, help="diffusion sampling steps")  # 采样步数
+parser.add_argument("--generation_num_samples", type=int, default=3, help="number of generated images per EEG")  # 每条EEG生成图片数
+parser.add_argument("--generation_eval_items", type=int, default=64, help="maximum EEG items sampled per split; zero means all")  # 采样样本上限
 parser.add_argument("--generation_skip_sampling", type=str2bool, default=False, help="skip saving generated PNGs after training")  # 是否跳过采样
 parser.add_argument("--output_dir", type=str, default="../result/generation", help="Stage-3 output directory")  # 输出目录
 
