@@ -3,6 +3,7 @@
 import csv
 import json
 import math
+import os
 import random
 import time
 from pathlib import Path
@@ -259,9 +260,20 @@ class Exp_Stage3_Generation:
         torch.save({"epoch": epoch, "metrics": metrics, "condition_adapter": self.condition_adapter.state_dict(), "unet_trainable": unet_state, "stage1_model": stage1_state, "optimizer": self.optimizer.state_dict(), "stage1_checkpoint": str(self.stage1_checkpoint_path)}, path)
         return path
 
+    def _write_metrics(self, history):
+        """Persist completed epoch metrics atomically so they survive interruptions."""
+        path = self.output_dir / "metrics.json"
+        temp_path = path.with_suffix(path.suffix + ".tmp")
+        with temp_path.open("w", encoding="utf-8") as handle:
+            json.dump(history, handle, ensure_ascii=False, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+
     def train(self):
         best = math.inf
         history = []
+        self._write_metrics(history)
         epoch_progress = tqdm(range(1, self.args.generation_epochs + 1), desc="Stage-3 total", unit="epoch", position=0, dynamic_ncols=True)
         for epoch in epoch_progress:
             self.stage1_model.train(self.args.generation_stage1_lr > 0)
@@ -285,14 +297,13 @@ class Exp_Stage3_Generation:
             val_metrics = self._evaluate(self.val_data, "val")
             row = {"epoch": epoch, "train": train_metrics, "val": val_metrics, "epoch_time_sec": time.time() - start}
             history.append(row)
+            self._write_metrics(history)
             epoch_progress.set_postfix(train_loss=f"{train_metrics['loss']:.4f}", val_loss=f"{val_metrics['loss']:.4f}", refresh=True)
             print(f"Epoch {epoch}: train_loss={train_metrics['loss']:.6f}, val_loss={val_metrics['loss']:.6f}")
             if val_metrics["loss"] < best:
                 best = val_metrics["loss"]
                 self._save_checkpoint(epoch, row)
         epoch_progress.close()
-        with (self.output_dir / "metrics.json").open("w", encoding="utf-8") as handle:
-            json.dump(history, handle, ensure_ascii=False, indent=2)
         return history
 
     def _decode(self, latents):
