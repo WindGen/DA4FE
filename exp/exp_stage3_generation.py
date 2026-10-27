@@ -19,6 +19,7 @@ from tqdm.auto import tqdm
 
 from data_provider.generation_dataset import EEGImageNetHuggingFaceGenerationDataset, generation_collate
 from models.eeg_sd_condition import EEGConditionAdapter
+from models.eeg_clip_alignment import EEGImageProjection
 from utils.checkpointing import load_checkpoint_object, load_model_state, unwrap_model
 from exp.exp_stage1_feature import Stage1FeatureModel
 from models import DA4FE
@@ -54,6 +55,22 @@ class Exp_Stage3_Generation:
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
     def _load_stage1_metadata(self):
+        stage3a_path = getattr(self.args, "stage3a_checkpoint", None)
+        if stage3a_path:
+            stage3a_path = Path(stage3a_path).expanduser()
+            if not stage3a_path.is_file():
+                raise FileNotFoundError(f"Stage-3A checkpoint does not exist: {stage3a_path}")
+            payload = load_checkpoint_object(stage3a_path, map_location="cpu")
+            if not isinstance(payload, dict) or "stage1_model" not in payload or "eeg_image_projection" not in payload:
+                raise ValueError(f"Not a compatible Stage-3A alignment checkpoint: {stage3a_path}")
+            if "stage1_args" not in payload or "projection_config" not in payload:
+                raise ValueError("Stage-3A checkpoint is missing stage1_args or projection_config")
+            self.stage3a_payload = payload
+            self.stage1_split_summary = payload.get("split_summary")
+            self.stage1_run_params_path = payload.get("stage1_run_params")
+            self.stage1_split_summary_path = None
+            return SimpleNamespace(**payload["stage1_args"]), stage3a_path
+
         run_dir = Path(self.args.stage1_run_dir).expanduser() if self.args.stage1_run_dir else None
         if run_dir is not None and run_dir.is_file():
             run_dir = run_dir.parent
@@ -115,16 +132,19 @@ class Exp_Stage3_Generation:
         backbone = DA4FE.Model(stage1_args).float()
         feature_dim = int(getattr(stage1_args, "stage1_backbone_feature_dim", getattr(stage1_args, "da4fe_fusion_out_dim", 512)))
         model = Stage1FeatureModel(backbone=backbone, feature_dim=feature_dim, num_class=stage1_args.num_class, args=stage1_args).float()
-        checkpoint = load_checkpoint_object(self.stage1_checkpoint_path, map_location="cpu")
-        try:
-            load_model_state(model, checkpoint)
-        except RuntimeError:
-            if isinstance(checkpoint, dict) and "backbone_state_dict" in checkpoint:
-                state = checkpoint["backbone_state_dict"]
-                state = {key.removeprefix("module."): value for key, value in state.items()}
-                model.backbone.load_state_dict(state)
-            else:
-                raise
+        if getattr(self, "stage3a_payload", None) is not None:
+            model.load_state_dict(self.stage3a_payload["stage1_model"])
+        else:
+            checkpoint = load_checkpoint_object(self.stage1_checkpoint_path, map_location="cpu")
+            try:
+                load_model_state(model, checkpoint)
+            except RuntimeError:
+                if isinstance(checkpoint, dict) and "backbone_state_dict" in checkpoint:
+                    state = checkpoint["backbone_state_dict"]
+                    state = {key.removeprefix("module."): value for key, value in state.items()}
+                    model.backbone.load_state_dict(state)
+                else:
+                    raise
         model.eval()
         for parameter in model.parameters():
             parameter.requires_grad = self.args.generation_stage1_lr > 0
@@ -172,7 +192,16 @@ class Exp_Stage3_Generation:
             cross_dim = int(cross_dim[0])
         if int(cross_dim) != int(self.args.generation_condition_dim):
             raise ValueError(f"generation_condition_dim={self.args.generation_condition_dim} does not match U-Net cross_attention_dim={cross_dim}")
-        self.condition_adapter = EEGConditionAdapter(self.feature_dim, context_dim=int(cross_dim), num_tokens=self.args.generation_context_tokens, hidden_dim=self.args.generation_adapter_hidden_dim, dropout=self.args.generation_adapter_dropout).to(self.device)
+        self.eeg_image_projection = None
+        condition_input_dim = self.feature_dim
+        if getattr(self, "stage3a_payload", None) is not None:
+            projection_config = self.stage3a_payload["projection_config"]
+            self.eeg_image_projection = EEGImageProjection(**projection_config).to(self.device)
+            self.eeg_image_projection.load_state_dict(self.stage3a_payload["eeg_image_projection"])
+            for parameter in self.eeg_image_projection.parameters():
+                parameter.requires_grad = self.args.generation_stage1_lr > 0
+            condition_input_dim = int(projection_config["output_dim"])
+        self.condition_adapter = EEGConditionAdapter(condition_input_dim, context_dim=int(cross_dim), num_tokens=self.args.generation_context_tokens, hidden_dim=self.args.generation_adapter_hidden_dim, dropout=self.args.generation_adapter_dropout).to(self.device)
         self.trainable_unet_parameters = []
         if self.args.generation_train_unet:
             for name, parameter in self.unet.named_parameters():
@@ -191,7 +220,10 @@ class Exp_Stage3_Generation:
                 parameter.requires_grad = False
         params = [{"params": list(self.condition_adapter.parameters()) + self.trainable_unet_parameters, "lr": self.args.generation_lr}]
         if self.args.generation_stage1_lr > 0:
-            params.append({"params": [parameter for parameter in self.stage1_model.parameters() if parameter.requires_grad], "lr": self.args.generation_stage1_lr})
+            feature_params = [parameter for parameter in self.stage1_model.parameters() if parameter.requires_grad]
+            if self.eeg_image_projection is not None:
+                feature_params.extend(parameter for parameter in self.eeg_image_projection.parameters() if parameter.requires_grad)
+            params.append({"params": feature_params, "lr": self.args.generation_stage1_lr})
         self.optimizer = torch.optim.AdamW(params, lr=self.args.generation_lr, weight_decay=self.args.generation_weight_decay)
 
     def _loader(self, dataset, train=False):
@@ -199,9 +231,13 @@ class Exp_Stage3_Generation:
 
     def _features(self, eeg):
         if self.args.generation_stage1_lr > 0:
-            return self.stage1_model(eeg, return_features=True)[1]
-        with torch.no_grad():
-            return self.stage1_model(eeg, return_features=True)[1]
+            features = self.stage1_model(eeg, return_features=True)[1]
+        else:
+            with torch.no_grad():
+                features = self.stage1_model(eeg, return_features=True)[1]
+        if self.eeg_image_projection is not None:
+            features = F.normalize(self.eeg_image_projection(features), p=2, dim=-1)
+        return features
 
     def _clip_values(self, images):
         images = (images + 1.0) / 2.0
@@ -257,8 +293,22 @@ class Exp_Stage3_Generation:
         trainable_names = {name for name, parameter in self.unet.named_parameters() if parameter.requires_grad}
         unet_state = {name: value.detach().cpu() for name, value in self.unet.state_dict().items() if name in trainable_names}
         stage1_state = self.stage1_model.state_dict() if self.args.generation_stage1_lr > 0 else None
-        torch.save({"epoch": epoch, "metrics": metrics, "condition_adapter": self.condition_adapter.state_dict(), "unet_trainable": unet_state, "stage1_model": stage1_state, "optimizer": self.optimizer.state_dict(), "stage1_checkpoint": str(self.stage1_checkpoint_path)}, path)
+        projection_state = self.eeg_image_projection.state_dict() if self.eeg_image_projection is not None else None
+        torch.save({"epoch": epoch, "metrics": metrics, "condition_adapter": self.condition_adapter.state_dict(), "unet_trainable": unet_state, "stage1_model": stage1_state, "eeg_image_projection": projection_state, "optimizer": self.optimizer.state_dict(), "stage1_checkpoint": str(self.stage1_checkpoint_path)}, path)
         return path
+
+    def _load_best_checkpoint(self):
+        path = self.output_dir / "checkpoint.pth"
+        if not path.is_file():
+            return
+        checkpoint = load_checkpoint_object(path, map_location=self.device)
+        self.condition_adapter.load_state_dict(checkpoint["condition_adapter"])
+        if checkpoint.get("unet_trainable"):
+            self.unet.load_state_dict(checkpoint["unet_trainable"], strict=False)
+        if checkpoint.get("stage1_model") is not None:
+            self.stage1_model.load_state_dict(checkpoint["stage1_model"], strict=False)
+        if self.eeg_image_projection is not None and checkpoint.get("eeg_image_projection") is not None:
+            self.eeg_image_projection.load_state_dict(checkpoint["eeg_image_projection"])
 
     def _write_metrics(self, history):
         """Persist completed epoch metrics atomically so they survive interruptions."""
@@ -304,6 +354,7 @@ class Exp_Stage3_Generation:
                 best = val_metrics["loss"]
                 self._save_checkpoint(epoch, row)
         epoch_progress.close()
+        self._load_best_checkpoint()
         return history
 
     def _decode(self, latents):

@@ -1,5 +1,6 @@
 """Datasets and image preprocessing for DreamDiffusion-style Stage-3 training."""
 
+import hashlib
 import random
 
 import numpy as np
@@ -38,6 +39,7 @@ class EEGImageNetHuggingFaceGenerationDataset(Dataset):
         self.flag = str(flag).upper()
         self.training = self.flag == "TRAIN"
         self.image_size = int(getattr(args, "generation_image_size", 512))
+        self.random_crop = bool(getattr(args, "generation_random_crop", self.training))
         self.base = EEGImageNetHuggingFaceLoader(args=args, root_path="", flag=self.flag)
         # Fail at construction, rather than halfway through an epoch, with an
         # actionable message when a dataset revision has no paired images.
@@ -54,10 +56,18 @@ class EEGImageNetHuggingFaceGenerationDataset(Dataset):
 
     def __getitem__(self, index):
         eeg, label = self.base[index]
-        image = _resize_crop(self.base.get_image(index), self.image_size, self.training)
+        source_image = self.base.get_image(index).convert("RGB")
+        thumbnail = source_image.resize((32, 32), resample=2)
+        image_id = hashlib.sha1(thumbnail.tobytes()).hexdigest()
+        image = _resize_crop(
+            source_image,
+            self.image_size,
+            self.training and self.random_crop,
+        )
         return {
             "eeg": eeg.float(),
             "image": image.float(),
+            "image_id": image_id,
             "label": label.long().reshape(()),
             "subject": self.base.get_subject(index),
             "label_name": self.base.get_label_name(index),
@@ -82,6 +92,7 @@ def generation_collate(batch, max_len=None):
         "eeg": eeg,
         "padding_mask": padding_mask,
         "image": torch.stack([item["image"] for item in batch]),
+        "image_id": [item["image_id"] for item in batch],
         "label": torch.stack([item["label"] for item in batch]),
         "subject": [item["subject"] for item in batch],
         "label_name": [item["label_name"] for item in batch],

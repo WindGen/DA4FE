@@ -153,6 +153,10 @@ def load_stage3_state(experiment, checkpoint):
     if stage1_state is not None:
         experiment.stage1_model.load_state_dict(stage1_state, strict=False)
 
+    projection_state = checkpoint.get("eeg_image_projection") if isinstance(checkpoint, dict) else None
+    if projection_state is not None and experiment.eeg_image_projection is not None:
+        experiment.eeg_image_projection.load_state_dict(projection_state)
+
     experiment.stage1_model.eval()
     experiment.condition_adapter.eval()
     experiment.unet.eval()
@@ -283,6 +287,8 @@ def main():
         values["stage1_run_dir"] = resolve_relative(values["stage1_run_dir"], ROOT)
     if values.get("stage1_checkpoint"):
         values["stage1_checkpoint"] = resolve_relative(values["stage1_checkpoint"], ROOT)
+    if values.get("stage3a_checkpoint"):
+        values["stage3a_checkpoint"] = resolve_relative(values["stage3a_checkpoint"], checkpoint_path.parent)
 
     args = SimpleNamespace(**values)
     set_seed(int(args.seed))

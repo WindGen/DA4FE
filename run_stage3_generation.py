@@ -34,11 +34,12 @@ parser = argparse.ArgumentParser(description="DreamDiffusion-style Stage-3 EEG i
 # DA4FE checkpoint and Hugging Face data configuration.
 parser.add_argument("--stage1_run_dir", type=str_or_none, default="../result/DA4FE/stage1/20260918_144539", help="DA4FE run directory containing run_params.json, split_summary.json and checkpoint.pth")  # DA4FE参数目录
 parser.add_argument("--stage1_checkpoint", type=str_or_none, default=None, help="optional DA4FE checkpoint path; otherwise checkpoint.pth is read from --stage1_run_dir")  # DA4FE权重
+parser.add_argument("--stage3a_checkpoint", type=str_or_none, default=None, help="optional Stage-3A EEG-CLIP alignment checkpoint; when set it supplies the aligned DA4FE and projection head")  # Stage-3A对齐权重
 parser.add_argument("--stage1_run_params", type=str_or_none, default=None, help="optional run_params.json path; otherwise read from --stage1_run_dir")  # DA4FE参数文件
 parser.add_argument("--stage1_split_summary", type=str_or_none, default=None, help="optional split_summary.json path; otherwise read from --stage1_run_dir")  # 数据划分参数
 parser.add_argument("--eeg_hf_dataset_id", type=str_or_none, default=None, help="override Hugging Face dataset id from DA4FE run_params.json")  # HF数据集
 parser.add_argument("--eeg_hf_cache_dir", type=str_or_none, default=None, help="override Hugging Face cache directory")  # HF缓存目录
-parser.add_argument("--eeg_hf_split_mode", choices=["original", "self"], default="original", help="override original/self split mode from DA4FE run_params.json")  # HF划分方式
+parser.add_argument("--eeg_hf_split_mode", choices=["original", "self"], default=None, help="override original/self split mode from DA4FE run_params.json")  # HF划分方式
 parser.add_argument("--eeg_hf_split_seed", type=int, default=None, help="random seed for HF self split")  # HF划分随机种子
 parser.add_argument("--eeg_hf_train_ratio", type=float, default=None, help="train ratio for HF self split")  # HF训练比例
 parser.add_argument("--eeg_hf_val_ratio", type=float, default=None, help="validation ratio for HF self split")  # HF验证比例
@@ -83,8 +84,8 @@ parser.add_argument("--use_gpu", type=str2bool, default=True, help="use CUDA whe
 
 def main():
     args = parser.parse_args()
-    if not args.stage1_run_dir and not args.stage1_run_params:
-        parser.error("--stage1_run_dir or --stage1_run_params is required")
+    if not args.stage3a_checkpoint and not args.stage1_run_dir and not args.stage1_run_params:
+        parser.error("--stage3a_checkpoint, --stage1_run_dir or --stage1_run_params is required")
     if args.generation_image_size % 8 != 0:
         parser.error("--generation_image_size must be divisible by 8")
     random.seed(args.seed)
