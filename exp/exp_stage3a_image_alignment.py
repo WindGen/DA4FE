@@ -170,7 +170,10 @@ class Exp_Stage3A_ImageAlignment:
         try:
             from transformers import CLIPVisionModelWithProjection
         except ImportError as exc:
-            raise ImportError("Stage-3A requires transformers>=4.40.0") from exc
+            raise ImportError(
+                "Stage-3A requires transformers>=4.40.0; install the pinned project version "
+                "in the active environment with: python -m pip install transformers==4.44.2"
+            ) from exc
         clip_model = CLIPVisionModelWithProjection.from_pretrained(
             self._resolve_clip_path(),
             cache_dir=self.args.hf_cache_dir,

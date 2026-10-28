@@ -32,7 +32,7 @@ def str_or_none(value):
 parser = argparse.ArgumentParser(description="Stage-3A: align DA4FE EEG features with paired CLIP image features")
 
 # DA4FE checkpoint and paired Hugging Face EEG-image dataset.
-parser.add_argument("--stage1_run_dir", type=str_or_none, default="../result/DA4FE/stage1/20260918_144539", help="DA4FE run directory containing run_params.json, split_summary.json and checkpoint.pth")  # Stage-1参数目录
+parser.add_argument("--stage1_run_dir", type=str_or_none, default=None, help="DA4FE run directory containing run_params.json and checkpoint.pth")  # Stage-1参数目录
 parser.add_argument("--stage1_checkpoint", type=str_or_none, default=None, help="optional DA4FE checkpoint path; defaults to checkpoint.pth in the run directory")  # Stage-1权重
 parser.add_argument("--stage1_run_params", type=str_or_none, default=None, help="optional Stage-1 run_params.json path")  # Stage-1参数文件
 parser.add_argument("--stage1_split_summary", type=str_or_none, default=None, help="optional Stage-1 split_summary.json path")  # 数据划分信息
