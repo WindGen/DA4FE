@@ -29,7 +29,7 @@ def str_or_none(value):
     return str(value)
 
 
-parser = argparse.ArgumentParser(description="Stage-3A: align DA4FE EEG features with paired CLIP image features")
+parser = argparse.ArgumentParser(description="Stage-3A: align DA4FE EEG features with paired CLIP image embeddings")
 
 # DA4FE checkpoint and paired Hugging Face EEG-image dataset.
 parser.add_argument("--stage1_run_dir", type=str_or_none, default=None, help="DA4FE run directory containing run_params.json and checkpoint.pth")  # Stage-1参数目录
@@ -60,7 +60,7 @@ parser.add_argument("--stage3a_projection_hidden_dim", type=int, default=1024, h
 parser.add_argument("--stage3a_projection_dropout", type=float, default=0.1, help="dropout in the EEG-to-CLIP projection head")  # 投影头Dropout
 parser.add_argument("--stage3a_projection_lr", type=float, default=1e-4, help="learning rate for the EEG-to-CLIP projection head")  # 投影头学习率
 parser.add_argument("--stage3a_da4fe_lr", type=float, default=1e-6, help="learning rate for DA4FE when stage3a_train_da4fe is true")  # DA4FE微调学习率
-parser.add_argument("--stage3a_temperature", type=float, default=0.07, help="temperature for multi-positive EEG-image contrastive loss")  # 对比损失温度
+parser.add_argument("--stage3a_temperature", type=float, default=0.07, help="deprecated and unused by paired cosine alignment; retained for CLI compatibility")  # 旧版对比温度，现不使用
 parser.add_argument("--stage3a_classification_weight", type=float, default=0.1, help="auxiliary DA4FE class-loss weight when DA4FE is unfrozen")  # 分类辅助损失权重
 parser.add_argument("--stage3a_weight_decay", type=float, default=1e-2, help="AdamW weight decay")  # 权重衰减
 parser.add_argument("--stage3a_grad_clip", type=float, default=1.0, help="gradient clipping norm")  # 梯度裁剪
@@ -78,8 +78,6 @@ def main():
         parser.error("--stage1_run_dir or --stage1_run_params is required")
     if args.stage3a_epochs <= 0 or args.stage3a_batch_size <= 0:
         parser.error("--stage3a_epochs and --stage3a_batch_size must be positive")
-    if args.stage3a_temperature <= 0:
-        parser.error("--stage3a_temperature must be positive")
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -89,6 +87,8 @@ def main():
     args.output_dir = str(Path(args.output_dir).expanduser() / timestamp)
     experiment = Exp_Stage3A_ImageAlignment(args)
     run_params = vars(args).copy()
+    run_params["clip_target"] = experiment.clip_target
+    run_params["alignment_loss"] = "paired_cosine_distance"
     run_params["stage1_checkpoint_resolved"] = str(experiment.stage1_checkpoint_path.resolve())
     run_params["stage1_run_params_resolved"] = str(experiment.stage1_run_params_path.resolve())
     run_params["stage1_args"] = vars(experiment.stage1_args)

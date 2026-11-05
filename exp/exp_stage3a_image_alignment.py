@@ -1,4 +1,4 @@
-"""Align DA4FE EEG features with paired frozen CLIP image features."""
+"""Align DA4FE EEG features with paired frozen CLIP image embeddings."""
 
 import csv
 import json
@@ -35,7 +35,7 @@ def _first_existing(paths):
 
 
 class Exp_Stage3A_ImageAlignment:
-    """Train an EEG projection against frozen CLIP features of paired images."""
+    """Train an EEG projection against frozen CLIP embeddings of paired images."""
 
     def __init__(self, args):
         self.args = args
@@ -181,7 +181,10 @@ class Exp_Stage3A_ImageAlignment:
         ).to(self.device).eval()
         for parameter in clip_model.parameters():
             parameter.requires_grad = False
-        clip_dim = int(getattr(clip_model.vision_model.config, "hidden_size", 1024))
+        clip_dim = getattr(clip_model.config, "projection_dim", None)
+        if clip_dim is None:
+            clip_dim = clip_model.visual_projection.out_features
+        clip_dim = int(clip_dim)
         projection = EEGImageProjection(
             input_dim=self.feature_dim,
             output_dim=clip_dim,
@@ -189,6 +192,7 @@ class Exp_Stage3A_ImageAlignment:
             dropout=self.args.stage3a_projection_dropout,
         ).to(self.device)
         self.clip_feature_dim = clip_dim
+        self.clip_target = "projected_image_embeds"
         self.projection_config = {
             "input_dim": self.feature_dim,
             "output_dim": clip_dim,
@@ -220,6 +224,11 @@ class Exp_Stage3A_ImageAlignment:
         payload = load_checkpoint_object(resume_path, map_location="cpu")
         if not isinstance(payload, dict) or "stage1_model" not in payload or "eeg_image_projection" not in payload:
             raise ValueError(f"Not a compatible Stage-3A checkpoint: {resume_path}")
+        if payload.get("clip_target") != self.clip_target:
+            raise ValueError(
+                "Stage-3A resume checkpoint uses a different CLIP target representation; "
+                "checkpoints trained against pooled vision features cannot resume against projected image embeddings"
+            )
         if int(payload.get("feature_dim", -1)) != self.feature_dim or int(payload.get("clip_feature_dim", -1)) != self.clip_feature_dim:
             raise ValueError("Stage-3A resume checkpoint dimensions do not match the current DA4FE/CLIP models")
         self.stage1_model.load_state_dict(payload["stage1_model"])
@@ -244,28 +253,13 @@ class Exp_Stage3A_ImageAlignment:
         return (images - mean) / std
 
     def _encode_clip_images(self, images):
-        output = self.clip_model.vision_model(pixel_values=self._clip_values(images))
-        return output.pooler_output.float()
+        output = self.clip_model(pixel_values=self._clip_values(images))
+        return output.image_embeds.float()
 
     @staticmethod
-    def _multi_positive_loss(eeg_embeddings, image_embeddings, image_ids, temperature):
-        logits = eeg_embeddings @ image_embeddings.T / temperature
-        positive = torch.tensor(
-            [[left == right for right in image_ids] for left in image_ids],
-            dtype=torch.bool,
-            device=logits.device,
-        )
-
-        def direction_loss(scores, positive_mask):
-            log_prob = scores - torch.logsumexp(scores, dim=1, keepdim=True)
-            positive_count = positive_mask.sum(dim=1).clamp_min(1)
-            positive_log_prob = log_prob.masked_fill(~positive_mask, 0.0).sum(dim=1) / positive_count
-            return -positive_log_prob.mean()
-
-        return 0.5 * (
-            direction_loss(logits, positive)
-            + direction_loss(logits.T, positive.T)
-        )
+    def _paired_cosine_loss(eeg_embeddings, image_embeddings):
+        """Minimize cosine distance between each EEG and its paired CLIP image embedding."""
+        return (1.0 - F.cosine_similarity(eeg_embeddings, image_embeddings, dim=-1)).mean()
 
     def _train_batch(self, batch):
         eeg = batch["eeg"].to(self.device, non_blocking=True).float()
@@ -278,12 +272,7 @@ class Exp_Stage3A_ImageAlignment:
             image_features = self._encode_clip_images(images)
         eeg_embeddings = F.normalize(projected.float(), dim=-1)
         image_embeddings = F.normalize(image_features.float(), dim=-1)
-        alignment_loss = self._multi_positive_loss(
-            eeg_embeddings,
-            image_embeddings,
-            batch["image_id"],
-            self.args.stage3a_temperature,
-        )
+        alignment_loss = self._paired_cosine_loss(eeg_embeddings, image_embeddings)
         classification_loss = torch.zeros((), device=self.device)
         if self.args.stage3a_train_da4fe and self.args.stage3a_classification_weight > 0:
             classification_loss = F.cross_entropy(logits.float(), labels)
@@ -319,10 +308,8 @@ class Exp_Stage3A_ImageAlignment:
                 projected = F.normalize(self.eeg_image_projection(features).float(), dim=-1)
                 image_features = F.normalize(self._encode_clip_images(images).float(), dim=-1)
                 count = len(batch["image_id"])
-                alignment_total += float(self._multi_positive_loss(
-                    projected, image_features, batch["image_id"], self.args.stage3a_temperature
-                )) * count
-                if self.args.stage3a_classification_weight > 0:
+                alignment_total += float(self._paired_cosine_loss(projected, image_features)) * count
+                if self.args.stage3a_train_da4fe and self.args.stage3a_classification_weight > 0:
                     classification_total += float(F.cross_entropy(logits.float(), batch["label"].to(self.device).long())) * count
                 total_count += count
                 eeg_values.append(projected.cpu())
@@ -332,17 +319,12 @@ class Exp_Stage3A_ImageAlignment:
         eeg_values = torch.cat(eeg_values).to(self.device)
         image_values = torch.cat(image_values).to(self.device)
         ids = np.asarray(image_ids, dtype=object)
-        losses, hits1, hits5 = [], [], []
+        hits1, hits5 = [], []
         gallery_size = len(image_ids)
         top_k = min(5, gallery_size)
         for start in range(0, gallery_size, 128):
             stop = min(start + 128, gallery_size)
-            scores = eeg_values[start:stop] @ image_values.T / self.args.stage3a_temperature
-            positive = torch.as_tensor(ids[start:stop, None] == ids[None, :], device=self.device)
-            log_prob = scores - torch.logsumexp(scores, dim=1, keepdim=True)
-            counts = positive.sum(dim=1).clamp_min(1)
-            row_loss = -(log_prob.masked_fill(~positive, 0.0).sum(dim=1) / counts)
-            losses.extend(row_loss.cpu().tolist())
+            scores = eeg_values[start:stop] @ image_values.T
             indices = scores.topk(top_k, dim=1).indices.cpu().numpy()
             retrieved_ids = ids[indices]
             matches = retrieved_ids == ids[start:stop, None]
@@ -350,10 +332,15 @@ class Exp_Stage3A_ImageAlignment:
             hits5.extend(matches.any(axis=1).astype(np.float32).tolist())
 
         paired_cosine = F.cosine_similarity(eeg_values, image_values, dim=-1).mean().item()
+        alignment_loss = alignment_total / max(total_count, 1)
+        classification_loss = classification_total / max(total_count, 1)
         result = {
-            "loss": float(np.mean(losses)),
-            "alignment_loss": alignment_total / max(total_count, 1),
-            "classification_loss": classification_total / max(total_count, 1),
+            "loss": alignment_loss + (
+                self.args.stage3a_classification_weight * classification_loss
+                if self.args.stage3a_train_da4fe else 0.0
+            ),
+            "alignment_loss": alignment_loss,
+            "classification_loss": classification_loss,
             "recall_at_1": float(np.mean(hits1)),
             "recall_at_5": float(np.mean(hits5)),
             "paired_cosine": float(paired_cosine),
@@ -367,7 +354,8 @@ class Exp_Stage3A_ImageAlignment:
 
     def _save_checkpoint(self, epoch, metrics):
         payload = {
-            "stage3a_version": 1,
+            "stage3a_version": 2,
+            "clip_target": self.clip_target,
             "epoch": int(epoch),
             "metrics": metrics,
             "stage1_model": self.stage1_model.state_dict(),
@@ -394,8 +382,8 @@ class Exp_Stage3A_ImageAlignment:
         self.eeg_image_projection.load_state_dict(payload["eeg_image_projection"])
 
     def train(self):
-        best_recall = -math.inf
         best_loss = math.inf
+        best_recall = -math.inf
         history = []
         progress = tqdm(range(1, self.args.stage3a_epochs + 1), desc="Stage-3A total", unit="epoch")
         for epoch in progress:
@@ -428,12 +416,12 @@ class Exp_Stage3A_ImageAlignment:
             self._append_metric(epoch, "val", val_metrics, epoch_time)
             history.append({"epoch": epoch, "train": train_metrics, "val": val_metrics, "epoch_time_sec": epoch_time})
             is_better = (
-                val_metrics["recall_at_1"] > best_recall
-                or (math.isclose(val_metrics["recall_at_1"], best_recall) and val_metrics["loss"] < best_loss)
+                val_metrics["loss"] < best_loss
+                or (math.isclose(val_metrics["loss"], best_loss) and val_metrics["recall_at_1"] > best_recall)
             )
             if is_better:
-                best_recall = val_metrics["recall_at_1"]
                 best_loss = val_metrics["loss"]
+                best_recall = val_metrics["recall_at_1"]
                 self._save_checkpoint(epoch, history[-1])
             progress.set_postfix(train=f"{train_metrics['loss']:.4f}", val_r1=f"{val_metrics['recall_at_1']:.3f}")
             print(
