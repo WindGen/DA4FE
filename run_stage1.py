@@ -40,6 +40,9 @@ def build_stage1_full_setting(args):
         f"_mse_{args.stage1_ms_epsilon}_msa_{args.stage1_ms_alpha}"
         f"_msb_{args.stage1_ms_beta}_msbase_{args.stage1_ms_base}"
         f"_l2norm_{int(args.stage1_l2_normalize)}"
+        f"_clipw_{args.stage1_clip_weight}_cliph_{args.stage1_clip_projection_hidden_dim}_clipd_{args.stage1_clip_feature_dim}"
+        f"_resw_{args.stage1_resnet_weight}_resh_{args.stage1_resnet_projection_hidden_dim}_resd_{args.stage1_resnet_feature_dim}"
+        f"_select_{args.stage1_selection_metric}"
         f"_cew_{args.stage1_ce_weight}_tw_{args.stage1_triplet_weight}"
         f"_useval_{int(getattr(args, 'use_validation', True))}"
         f"_ls_{args.stage1_label_smoothing}"
@@ -156,6 +159,23 @@ if __name__ == "__main__":
     # Final Stage-1 feature output.
     parser.add_argument("--stage1_l2_normalize", "--stage1-l2-normalize", type=str2bool, default=True, help="L2-normalize the final Stage-1 feature output")
 
+    # CLIP/ResNet50 image-feature alignment (requires paired images in the Hugging Face dataset).
+    parser.add_argument("--stage1_clip_weight", "--stage1-clip-weight", type=float, default=1.0, help="weight of paired EEG-to-CLIP image embedding cosine loss; set 0 to disable")
+    parser.add_argument("--stage1_clip_feature_dim", "--stage1-clip-feature-dim", type=int, default=768, help="output dimension of the selected CLIP model; openai/clip-vit-large-patch14 uses 768")
+    parser.add_argument("--stage1_clip_projection_hidden_dim", "--stage1-clip-projection-hidden-dim", type=int, default=1024, help="hidden dimension of the EEG-to-CLIP projection head")
+    parser.add_argument("--stage1_clip_projection_dropout", "--stage1-clip-projection-dropout", type=float, default=0.1, help="dropout of the EEG-to-CLIP projection head")
+    parser.add_argument("--stage1_clip_batch_size", "--stage1-clip-batch-size", type=int, default=32, help="batch size used to precompute frozen CLIP and ResNet50 image targets")
+    parser.add_argument("--stage1_clip_model_path", "--stage1-clip-model-path", type=str_or_none, default=None, help="local CLIP model path or Hugging Face model id; defaults to pretrained_root/clip-vit-large-patch14")
+    parser.add_argument("--stage1_resnet_weight", "--stage1-resnet-weight", type=float, default=0.25, help="weight of paired EEG-to-ResNet50 feature cosine loss; set 0 to disable")
+    parser.add_argument("--stage1_resnet_feature_dim", "--stage1-resnet-feature-dim", type=int, default=2048, help="output dimension of ResNet50 pooled layer-4 features")
+    parser.add_argument("--stage1_resnet_projection_hidden_dim", "--stage1-resnet-projection-hidden-dim", type=int, default=1024, help="hidden dimension of the EEG-to-ResNet50 projection head")
+    parser.add_argument("--stage1_resnet_projection_dropout", "--stage1-resnet-projection-dropout", type=float, default=0.1, help="dropout of the EEG-to-ResNet50 projection head")
+    parser.add_argument("--stage1_resnet_model_path", "--stage1-resnet-model-path", type=str_or_none, default=None, help="local ResNet50 model path or Hugging Face model id; defaults to pretrained_root/resnet-50")
+    parser.add_argument("--stage1_selection_metric", "--stage1-selection-metric", type=str, choices=["auto", "loss", "image_loss", "kmeans_score"], default="auto", help="checkpoint selection metric; auto uses joint validation loss when image alignment is active")
+    parser.add_argument("--pretrained_root", type=str, default="../pretrained", help="root directory containing locally saved pretrained models")
+    parser.add_argument("--hf_cache_dir", type=str_or_none, default=None, help="Hugging Face cache directory; None uses the system default")
+    parser.add_argument("--allow_hf_download", type=str2bool, default=True, help="load image teachers from cache and download missing files when enabled")
+
     # Optimization and run control.
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--log_dir", type=str_or_none, default=None)
@@ -217,6 +237,18 @@ if __name__ == "__main__":
         )
     if args.stage1_weight_decay < 0:
         parser.error("--stage1_weight_decay must be non-negative")
+    if args.stage1_clip_weight < 0:
+        parser.error("--stage1_clip_weight must be non-negative")
+    if args.stage1_resnet_weight < 0:
+        parser.error("--stage1_resnet_weight must be non-negative")
+    if args.stage1_selection_metric == "image_loss" and args.stage1_clip_weight == 0 and args.stage1_resnet_weight == 0:
+        parser.error("--stage1_selection_metric image_loss requires a positive CLIP or ResNet50 loss weight")
+    if args.stage1_clip_feature_dim <= 0 or args.stage1_clip_projection_hidden_dim <= 0 or args.stage1_resnet_feature_dim <= 0 or args.stage1_resnet_projection_hidden_dim <= 0 or args.stage1_clip_batch_size <= 0:
+        parser.error("CLIP/ResNet feature dimensions, projection hidden dimensions and image target batch size must be positive")
+    if not 0.0 <= args.stage1_clip_projection_dropout < 1.0:
+        parser.error("--stage1_clip_projection_dropout must be in [0, 1)")
+    if not 0.0 <= args.stage1_resnet_projection_dropout < 1.0:
+        parser.error("--stage1_resnet_projection_dropout must be in [0, 1)")
     split_ratios = np.asarray(
         [args.eeg_hf_train_ratio, args.eeg_hf_val_ratio, args.eeg_hf_test_ratio],
         dtype=np.float64,

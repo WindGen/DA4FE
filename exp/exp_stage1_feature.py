@@ -12,7 +12,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import optim
-from torch.utils.data import BatchSampler, ConcatDataset, DataLoader
+from torch.utils.data import BatchSampler, ConcatDataset, DataLoader, Dataset
 from tqdm.auto import tqdm
 
 try:
@@ -27,12 +27,14 @@ from data_provider.uea import collate_fn
 from exp.exp_basic import Exp_Basic
 from utils.checkpointing import (
     build_checkpoint_payload,
+    extract_model_state,
     load_checkpoint_object,
     load_model_state,
     unwrap_model,
 )
 from utils.stage_metrics import compute_kmeans_score
 from utils.tools import adjust_learning_rate
+from models.eeg_clip_alignment import EEGImageProjection
 
 warnings.filterwarnings("ignore")
 
@@ -85,7 +87,7 @@ class CosMarginHead(nn.Module):
 
 
 class Stage1FeatureModel(nn.Module):
-    def __init__(self, backbone, feature_dim, num_class, args):
+    def __init__(self, backbone, feature_dim, num_class, args, clip_feature_dim=0, resnet_feature_dim=0):
         super().__init__()
         self.backbone = backbone
         self.feature_dim = feature_dim
@@ -96,6 +98,22 @@ class Stage1FeatureModel(nn.Module):
             l2_normalize = l2_normalize.strip().lower() in {"true", "1", "yes", "y", "on"}
         self.l2_normalize_features = bool(l2_normalize)
         self.margin_head = None
+        self.clip_projection = None
+        if clip_feature_dim > 0:
+            self.clip_projection = EEGImageProjection(
+                input_dim=feature_dim,
+                output_dim=clip_feature_dim,
+                hidden_dim=getattr(args, "stage1_clip_projection_hidden_dim", 1024),
+                dropout=getattr(args, "stage1_clip_projection_dropout", 0.1),
+            )
+        self.resnet_projection = None
+        if resnet_feature_dim > 0:
+            self.resnet_projection = EEGImageProjection(
+                input_dim=feature_dim,
+                output_dim=resnet_feature_dim,
+                hidden_dim=getattr(args, "stage1_resnet_projection_hidden_dim", 1024),
+                dropout=getattr(args, "stage1_resnet_projection_dropout", 0.1),
+            )
 
         if self.loss_mode in {"arcface", "arcface_triplet"}:
             self.margin_head = ArcMarginHead(
@@ -324,6 +342,44 @@ class MergedStage1Dataset(ConcatDataset):
                 setattr(self, attribute, getattr(first, attribute))
 
 
+class Stage1ImageFeatureDataset(Dataset):
+    """Attach cached paired-image teacher embeddings to Stage-1 EEG samples."""
+
+    def __init__(self, dataset, clip_features=None, resnet_features=None):
+        self.dataset = dataset
+        self.clip_features = None if clip_features is None else torch.as_tensor(clip_features, dtype=torch.float32)
+        self.resnet_features = None if resnet_features is None else torch.as_tensor(resnet_features, dtype=torch.float32)
+        if self.clip_features is not None and len(dataset) != len(self.clip_features):
+            raise ValueError("CLIP feature count does not match the Stage-1 dataset")
+        if self.resnet_features is not None and len(dataset) != len(self.resnet_features):
+            raise ValueError("ResNet50 feature count does not match the Stage-1 dataset")
+        self.y = np.asarray(dataset.y, dtype=np.int64)
+        for attribute in ("num_class", "max_seq_len", "feature_dim", "class_names"):
+            if hasattr(dataset, attribute):
+                setattr(self, attribute, getattr(dataset, attribute))
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, index):
+        eeg, label = self.dataset[index]
+        clip_features = None if self.clip_features is None else self.clip_features[index]
+        resnet_features = None if self.resnet_features is None else self.resnet_features[index]
+        return eeg, label, clip_features, resnet_features
+
+
+def stage1_collate_fn(batch, max_len):
+    """Collate either ordinary EEG pairs or EEG pairs with CLIP targets."""
+    if len(batch[0]) == 2:
+        return collate_fn(batch, max_len=max_len)
+    eeg_batch, labels, padding_masks = collate_fn(
+        [(sample[0], sample[1]) for sample in batch], max_len=max_len
+    )
+    clip_targets = torch.stack([sample[2] for sample in batch], dim=0) if batch[0][2] is not None else None
+    resnet_targets = torch.stack([sample[3] for sample in batch], dim=0) if batch[0][3] is not None else None
+    return eeg_batch, labels, padding_masks, clip_targets, resnet_targets
+
+
 class Exp_Stage1_Feature(Exp_Basic):
     METRIC_FIELDNAMES = [
         "epoch",
@@ -331,6 +387,8 @@ class Exp_Stage1_Feature(Exp_Basic):
         "loss",
         "classification_loss",
         "metric_loss",
+        "clip_loss",
+        "resnet_loss",
         "kmeans_score",
         "mined_triplets",
         "learning_rate",
@@ -359,6 +417,17 @@ class Exp_Stage1_Feature(Exp_Basic):
         self.ms_miner = None
         self.ms_criterion = None
         self.classification_criterion = None
+        self.clip_model = None
+        self.clip_processor = None
+        self.resnet_model = None
+        self.resnet_processor = None
+        self.clip_feature_dim = 0
+        self.resnet_feature_dim = 0
+        self._image_dataset_cache = {}
+        self._image_feature_cache = {}
+        self.clip_enabled = float(getattr(args, "stage1_clip_weight", 0.0)) > 0.0
+        self.resnet_enabled = float(getattr(args, "stage1_resnet_weight", 0.0)) > 0.0
+        self.image_alignment_enabled = self.clip_enabled or self.resnet_enabled
         super().__init__(args)
         self.metrics_log_path = None
         self.split_summary_path = None
@@ -484,6 +553,8 @@ class Exp_Stage1_Feature(Exp_Basic):
         loss,
         classification_loss,
         metric_loss,
+        clip_loss,
+        resnet_loss,
         kmeans_score,
         mined_triplets=None,
         learning_rate=None,
@@ -499,6 +570,8 @@ class Exp_Stage1_Feature(Exp_Basic):
             "loss": float(loss),
             "classification_loss": float(classification_loss),
             "metric_loss": float(metric_loss),
+            "clip_loss": float(clip_loss),
+            "resnet_loss": float(resnet_loss),
             "kmeans_score": float(kmeans_score),
             "mined_triplets": "" if mined_triplets is None else int(mined_triplets),
             "learning_rate": "" if learning_rate is None else float(learning_rate),
@@ -529,16 +602,168 @@ class Exp_Stage1_Feature(Exp_Basic):
         backbone = self.model_dict[self.args.model].Model(self.args).float()
         feature_dim = self._infer_backbone_feature_dim(backbone)
         self.args.stage1_backbone_feature_dim = feature_dim
+        self.clip_feature_dim = (
+            int(getattr(self.args, "stage1_clip_feature_dim", 768)) if self.clip_enabled else 0
+        )
+        self.resnet_feature_dim = (
+            int(getattr(self.args, "stage1_resnet_feature_dim", 2048)) if self.resnet_enabled else 0
+        )
 
         model = Stage1FeatureModel(
             backbone=backbone,
             feature_dim=feature_dim,
             num_class=self.args.num_class,
             args=self.args,
+            clip_feature_dim=self.clip_feature_dim,
+            resnet_feature_dim=self.resnet_feature_dim,
         ).float()
         if self.args.use_multi_gpu and self.args.use_gpu:
             model = nn.DataParallel(model, device_ids=self.args.device_ids)
         return model
+
+    def _resolve_teacher_source(self, explicit_path, local_name, hub_id):
+        pretrained_root = Path(getattr(self.args, "pretrained_root", "../pretrained")).expanduser()
+        if explicit_path:
+            explicit_text = str(explicit_path)
+            explicit_local = Path(explicit_text).expanduser()
+            if explicit_local.exists():
+                return str(explicit_local), True
+            normalized = explicit_text.replace("\\", "/")
+            is_absolute_path = explicit_local.is_absolute() or normalized.startswith(("./", "../", "/")) or (len(normalized) > 2 and normalized[1:3] == ":/")
+            if is_absolute_path:
+                raise FileNotFoundError(f"Pretrained image model path does not exist: {explicit_text}")
+            return explicit_text, False
+        local_default = pretrained_root / local_name
+        if local_default.exists():
+            return str(local_default), True
+        return hub_id, False
+
+    def _load_image_teachers(self, image_dataset):
+        if not callable(getattr(image_dataset, "get_image", None)):
+            raise ValueError(
+                "Stage-1 image-feature alignment requires paired images from the "
+                "Hugging Face EEG-ImageNet dataset. The selected dataset has no get_image(index)."
+            )
+        try:
+            if self.clip_enabled and (self.clip_model is None or self.clip_processor is None):
+                from transformers import CLIPImageProcessor, CLIPVisionModelWithProjection
+
+                source, is_local = self._resolve_teacher_source(
+                    getattr(self.args, "stage1_clip_model_path", None),
+                    "clip-vit-large-patch14",
+                    "openai/clip-vit-large-patch14",
+                )
+                cache_dir = getattr(self.args, "hf_cache_dir", None)
+                local_files_only = is_local or not bool(getattr(self.args, "allow_hf_download", True))
+                self.clip_model = CLIPVisionModelWithProjection.from_pretrained(
+                    source, cache_dir=cache_dir, local_files_only=local_files_only
+                ).to(self.device).eval()
+                self.clip_processor = CLIPImageProcessor.from_pretrained(
+                    source, cache_dir=cache_dir, local_files_only=local_files_only
+                )
+                for parameter in self.clip_model.parameters():
+                    parameter.requires_grad = False
+                clip_dim = getattr(self.clip_model.config, "projection_dim", None)
+                if clip_dim is None:
+                    clip_dim = self.clip_model.visual_projection.out_features
+                if int(clip_dim) != self.clip_feature_dim:
+                    raise ValueError(
+                        f"Configured stage1_clip_feature_dim={self.clip_feature_dim}, but the loaded CLIP model outputs {int(clip_dim)} dimensions."
+                    )
+                print(f"Stage-1 CLIP teacher: {source} (feature_dim={self.clip_feature_dim})")
+
+            if self.resnet_enabled and (self.resnet_model is None or self.resnet_processor is None):
+                from transformers import AutoImageProcessor, ResNetForImageClassification
+
+                source, is_local = self._resolve_teacher_source(
+                    getattr(self.args, "stage1_resnet_model_path", None),
+                    "resnet-50",
+                    "microsoft/resnet-50",
+                )
+                cache_dir = getattr(self.args, "hf_cache_dir", None)
+                local_files_only = is_local or not bool(getattr(self.args, "allow_hf_download", True))
+                self.resnet_model = ResNetForImageClassification.from_pretrained(
+                    source, cache_dir=cache_dir, local_files_only=local_files_only
+                ).to(self.device).eval()
+                self.resnet_processor = AutoImageProcessor.from_pretrained(
+                    source, cache_dir=cache_dir, local_files_only=local_files_only
+                )
+                for parameter in self.resnet_model.parameters():
+                    parameter.requires_grad = False
+                hidden_sizes = getattr(self.resnet_model.config, "hidden_sizes", None)
+                resnet_dim = int(hidden_sizes[-1]) if hidden_sizes else self.resnet_model.classifier[-1].in_features
+                if resnet_dim != self.resnet_feature_dim:
+                    raise ValueError(
+                        f"Configured stage1_resnet_feature_dim={self.resnet_feature_dim}, but the loaded ResNet model outputs {resnet_dim} dimensions."
+                    )
+                print(f"Stage-1 ResNet50 teacher: {source} (feature_dim={self.resnet_feature_dim})")
+        except ImportError as exc:
+            raise ImportError(
+                "Stage-1 CLIP/ResNet image alignment requires transformers==4.44.2."
+            ) from exc
+
+    def _with_image_targets(self, dataset):
+        if not self.image_alignment_enabled:
+            return dataset
+        cached = self._image_dataset_cache.get(id(dataset))
+        if cached is not None:
+            return cached
+        if not callable(getattr(dataset, "get_image", None)):
+            raise ValueError(
+                "Stage-1 image-feature alignment is enabled, but this dataset has no paired image accessor."
+            )
+
+        underlying_dataset = getattr(dataset, "dataset", dataset)
+        feature_key = (
+            id(underlying_dataset),
+            getattr(dataset, "dataset_id", None),
+            getattr(dataset, "split_name", getattr(dataset, "flag", None)),
+        )
+        image_targets = self._image_feature_cache.get(feature_key)
+        if image_targets is None:
+            self._load_image_teachers(dataset)
+            batch_size = max(1, int(getattr(self.args, "stage1_clip_batch_size", 32)))
+            clip_batches = []
+            resnet_batches = []
+            for start in tqdm(
+                range(0, len(dataset), batch_size),
+                desc=f"Extract paired image features ({getattr(dataset, 'flag', 'split')})",
+                unit="batch",
+                leave=False,
+                dynamic_ncols=True,
+            ):
+                images = [dataset.get_image(index) for index in range(start, min(start + batch_size, len(dataset)))]
+                with torch.no_grad():
+                    if self.clip_enabled:
+                        clip_pixels = self.clip_processor(images=images, return_tensors="pt").pixel_values.to(self.device)
+                        clip_features = self.clip_model(pixel_values=clip_pixels).image_embeds.float()
+                        clip_batches.append(F.normalize(clip_features, p=2, dim=-1).cpu())
+                    if self.resnet_enabled:
+                        resnet_pixels = self.resnet_processor(images=images, return_tensors="pt").pixel_values.to(self.device)
+                        resnet_output = self.resnet_model.resnet(pixel_values=resnet_pixels)
+                        resnet_features = resnet_output.pooler_output.float().flatten(1)
+                        resnet_batches.append(F.normalize(resnet_features, p=2, dim=-1).cpu())
+
+            image_targets = {
+                "clip": torch.cat(clip_batches, dim=0) if self.clip_enabled else None,
+                "resnet": torch.cat(resnet_batches, dim=0) if self.resnet_enabled else None,
+            }
+            self._image_feature_cache[feature_key] = image_targets
+        wrapped = Stage1ImageFeatureDataset(dataset, image_targets["clip"], image_targets["resnet"])
+        self._image_dataset_cache[id(dataset)] = wrapped
+        return wrapped
+
+    def _release_image_teachers(self):
+        if self.clip_model is not None:
+            self.clip_model.to("cpu")
+            self.clip_model = None
+            self.clip_processor = None
+        if self.resnet_model is not None:
+            self.resnet_model.to("cpu")
+            self.resnet_model = None
+            self.resnet_processor = None
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
 
     def _get_data(self, flag):
         random.seed(self.args.seed)
@@ -557,6 +782,7 @@ class Exp_Stage1_Feature(Exp_Basic):
         return self.loss_mode in self.CLASSIFICATION_LOSS_MODES
 
     def _build_train_loader(self, train_data):
+        collate = lambda items: stage1_collate_fn(items, max_len=self.args.seq_len)
         if not self._use_metric_loss():
             return DataLoader(
                 train_data,
@@ -564,7 +790,7 @@ class Exp_Stage1_Feature(Exp_Basic):
                 shuffle=True,
                 num_workers=self.args.num_workers,
                 drop_last=False,
-                collate_fn=lambda x: collate_fn(x, max_len=self.args.seq_len),
+                collate_fn=collate,
             )
 
         sampler = ClassBalancedBatchSampler(
@@ -578,7 +804,7 @@ class Exp_Stage1_Feature(Exp_Basic):
             train_data,
             batch_sampler=sampler,
             num_workers=self.args.num_workers,
-            collate_fn=lambda x: collate_fn(x, max_len=self.args.seq_len),
+            collate_fn=collate,
         )
 
     def _build_eval_loader(self, dataset):
@@ -588,7 +814,7 @@ class Exp_Stage1_Feature(Exp_Basic):
             shuffle=False,
             num_workers=self.args.num_workers,
             drop_last=False,
-            collate_fn=lambda x: collate_fn(x, max_len=self.args.seq_len),
+            collate_fn=lambda x: stage1_collate_fn(x, max_len=self.args.seq_len),
         )
 
     def _select_optimizer(self):
@@ -706,22 +932,44 @@ class Exp_Stage1_Feature(Exp_Basic):
 
         return self.classification_criterion(logits, labels.long())
 
-    def _compute_total_loss(self, logits, embeddings, labels):
+    def _compute_total_loss(self, logits, fused_features, embeddings, labels, clip_targets=None, resnet_targets=None):
         classification_loss = self._compute_classification_component(
             logits, embeddings, labels
         )
         metric_loss, mined_triplets = self._compute_metric_component(embeddings, labels)
+        clip_loss = embeddings.sum() * 0.0
+        resnet_loss = embeddings.sum() * 0.0
+        if self.clip_enabled:
+            if clip_targets is None:
+                raise ValueError("CLIP alignment is enabled but this batch has no paired CLIP targets")
+            stage1_model = unwrap_model(self.model)
+            projected = F.normalize(stage1_model.clip_projection(fused_features).float(), p=2, dim=-1)
+            clip_targets = F.normalize(clip_targets.to(self.device).float(), p=2, dim=-1)
+            clip_loss = (1.0 - F.cosine_similarity(projected, clip_targets, dim=-1)).mean()
+        if self.resnet_enabled:
+            if resnet_targets is None:
+                raise ValueError("ResNet50 alignment is enabled but this batch has no paired ResNet targets")
+            stage1_model = unwrap_model(self.model)
+            projected = F.normalize(stage1_model.resnet_projection(fused_features).float(), p=2, dim=-1)
+            resnet_targets = F.normalize(resnet_targets.to(self.device).float(), p=2, dim=-1)
+            resnet_loss = (1.0 - F.cosine_similarity(projected, resnet_targets, dim=-1)).mean()
 
         total_loss = logits.sum() * 0.0
         if self._use_classification_loss():
             total_loss = total_loss + self.args.stage1_ce_weight * classification_loss
         if self._use_metric_loss():
             total_loss = total_loss + self.args.stage1_triplet_weight * metric_loss
+        if self.clip_enabled:
+            total_loss = total_loss + self.args.stage1_clip_weight * clip_loss
+        if self.resnet_enabled:
+            total_loss = total_loss + self.args.stage1_resnet_weight * resnet_loss
 
         return (
             total_loss,
             float(classification_loss.detach().item()),
             float(metric_loss.detach().item()),
+            float(clip_loss.detach().item()),
+            float(resnet_loss.detach().item()),
             mined_triplets,
         )
 
@@ -729,6 +977,8 @@ class Exp_Stage1_Feature(Exp_Basic):
         total_loss = []
         classification_losses = []
         metric_losses = []
+        clip_losses = []
+        resnet_losses = []
         feature_rows = []
         label_rows = []
         mined_triplets = 0
@@ -746,16 +996,21 @@ class Exp_Stage1_Feature(Exp_Basic):
                 if desc
                 else data_loader
             )
-            for batch_x, label, padding_mask in iterator:
+            for batch in iterator:
+                batch_x, label, padding_mask = batch[:3]
+                clip_targets = batch[3] if len(batch) > 3 else None
+                resnet_targets = batch[4] if len(batch) > 4 else None
                 batch_x = batch_x.float().to(self.device)
                 label = label.to(self.device)
                 logits, fused_features, embeddings = self._extract_features(batch_x)
-                loss, classification_loss, metric_loss, batch_triplets = self._compute_total_loss(
-                    logits, embeddings, label
+                loss, classification_loss, metric_loss, clip_loss, resnet_loss, batch_triplets = self._compute_total_loss(
+                    logits, fused_features, embeddings, label, clip_targets, resnet_targets
                 )
                 total_loss.append(loss.item())
                 classification_losses.append(classification_loss)
                 metric_losses.append(metric_loss)
+                clip_losses.append(clip_loss)
+                resnet_losses.append(resnet_loss)
                 mined_triplets += batch_triplets
                 feature_rows.append(embeddings.cpu().numpy())
                 label_rows.append(label.detach().cpu().numpy())
@@ -768,6 +1023,8 @@ class Exp_Stage1_Feature(Exp_Basic):
         total_loss = float(np.average(total_loss))
         classification_loss = float(np.average(classification_losses))
         metric_loss = float(np.average(metric_losses))
+        clip_loss = float(np.average(clip_losses))
+        resnet_loss = float(np.average(resnet_losses))
         embeddings = np.concatenate(feature_rows, axis=0)
         labels = np.concatenate(label_rows, axis=0)
         kmeans_score = compute_kmeans_score(
@@ -777,7 +1034,7 @@ class Exp_Stage1_Feature(Exp_Basic):
             random_state=self.args.seed,
         )
         self.model.train()
-        return total_loss, classification_loss, metric_loss, kmeans_score, mined_triplets
+        return total_loss, classification_loss, metric_loss, clip_loss, resnet_loss, kmeans_score, mined_triplets
 
     def _maybe_resume_from_checkpoint(self):
         checkpoint_path = getattr(self.args, "resume_ckpt", None)
@@ -789,14 +1046,36 @@ class Exp_Stage1_Feature(Exp_Basic):
             raise FileNotFoundError(f"Resume checkpoint not found: {checkpoint_path}")
 
         checkpoint = load_checkpoint_object(checkpoint_path, map_location=self.device)
-        load_model_state(self.model, checkpoint)
-        print(f"Loaded checkpoint for stage1 training: {checkpoint_path}")
+        try:
+            load_model_state(self.model, checkpoint)
+            print(f"Loaded checkpoint for stage1 training: {checkpoint_path}")
+        except RuntimeError:
+            state_dict = extract_model_state(checkpoint)
+            state_dict = {key.removeprefix("module."): value for key, value in state_dict.items()}
+            incompatible = unwrap_model(self.model).load_state_dict(state_dict, strict=False)
+            allowed_prefixes = ("clip_projection.", "resnet_projection.")
+            invalid_missing = [key for key in incompatible.missing_keys if not key.startswith(allowed_prefixes)]
+            invalid_unexpected = [key for key in incompatible.unexpected_keys if not key.startswith(allowed_prefixes)]
+            if invalid_missing or invalid_unexpected:
+                raise RuntimeError(
+                    "Resume checkpoint is incompatible with the current Stage-1 model; "
+                    f"missing={invalid_missing}, unexpected={invalid_unexpected}"
+                )
+            print(
+                f"Loaded compatible Stage-1 weights from {checkpoint_path}; "
+                "new or disabled image projection heads were initialized according to current parameters."
+            )
         return checkpoint
 
     def train(self, setting):
         raw_train_data, _ = self._get_data(flag="TRAIN")
         raw_vali_data, _ = self._get_data(flag="VAL")
         test_data, _ = self._get_data(flag="TEST")
+
+        raw_train_data = self._with_image_targets(raw_train_data)
+        raw_vali_data = self._with_image_targets(raw_vali_data)
+        test_data = self._with_image_targets(test_data)
+        self._release_image_teachers()
 
         if self.use_validation:
             train_data = raw_train_data
@@ -834,7 +1113,13 @@ class Exp_Stage1_Feature(Exp_Basic):
         self._select_criterion()
         self._maybe_resume_from_checkpoint()
 
-        best_selection_kmeans = -np.inf
+        configured_selection = str(getattr(self.args, "stage1_selection_metric", "auto")).lower()
+        if configured_selection == "auto":
+            selection_metric_name = "loss" if self.image_alignment_enabled else "kmeans_score"
+        else:
+            selection_metric_name = configured_selection
+        maximize_selection_metric = selection_metric_name == "kmeans_score"
+        best_selection_metric = -np.inf if maximize_selection_metric else np.inf
         early_stop_counter = 0
 
         epoch_iterator = tqdm(
@@ -847,6 +1132,8 @@ class Exp_Stage1_Feature(Exp_Basic):
             step_total_losses = []
             step_classification_losses = []
             step_metric_losses = []
+            step_clip_losses = []
+            step_resnet_losses = []
             step_mined_triplets = []
 
             self.model.train()
@@ -858,19 +1145,24 @@ class Exp_Stage1_Feature(Exp_Basic):
                 leave=False,
                 dynamic_ncols=True,
             )
-            for batch_x, label, padding_mask in batch_iterator:
+            for batch in batch_iterator:
+                batch_x, label, padding_mask = batch[:3]
+                clip_targets = batch[3] if len(batch) > 3 else None
+                resnet_targets = batch[4] if len(batch) > 4 else None
                 model_optim.zero_grad()
 
                 batch_x = batch_x.float().to(self.device)
                 label = label.to(self.device)
                 logits, fused_features, embeddings = self._extract_features(batch_x)
-                loss, classification_loss, metric_loss, batch_triplets = self._compute_total_loss(
-                    logits, embeddings, label
+                loss, classification_loss, metric_loss, clip_loss, resnet_loss, batch_triplets = self._compute_total_loss(
+                    logits, fused_features, embeddings, label, clip_targets, resnet_targets
                 )
 
                 step_total_losses.append(loss.item())
                 step_classification_losses.append(classification_loss)
                 step_metric_losses.append(metric_loss)
+                step_clip_losses.append(clip_loss)
+                step_resnet_losses.append(resnet_loss)
                 step_mined_triplets.append(batch_triplets)
 
                 loss.backward()
@@ -888,12 +1180,16 @@ class Exp_Stage1_Feature(Exp_Basic):
             train_step_loss = float(np.average(step_total_losses))
             train_step_cls_loss = float(np.average(step_classification_losses))
             train_step_metric_loss = float(np.average(step_metric_losses))
+            train_step_clip_loss = float(np.average(step_clip_losses))
+            train_step_resnet_loss = float(np.average(step_resnet_losses))
             train_step_triplets = int(np.sum(step_mined_triplets))
 
             (
                 train_eval_loss,
                 train_eval_cls_loss,
                 train_eval_metric_loss,
+                train_eval_clip_loss,
+                train_eval_resnet_loss,
                 train_kmeans,
                 train_eval_triplets,
             ) = self._evaluate_loader(
@@ -904,6 +1200,8 @@ class Exp_Stage1_Feature(Exp_Basic):
                 selection_loss,
                 selection_cls_loss,
                 selection_metric_loss,
+                selection_clip_loss,
+                selection_resnet_loss,
                 selection_kmeans,
                 selection_triplets,
             ) = self._evaluate_loader(
@@ -918,6 +1216,8 @@ class Exp_Stage1_Feature(Exp_Basic):
                 loss=train_eval_loss,
                 classification_loss=train_eval_cls_loss,
                 metric_loss=train_eval_metric_loss,
+                clip_loss=train_eval_clip_loss,
+                resnet_loss=train_eval_resnet_loss,
                 kmeans_score=train_kmeans,
                 mined_triplets=train_eval_triplets,
                 learning_rate=current_lr,
@@ -930,6 +1230,8 @@ class Exp_Stage1_Feature(Exp_Basic):
                 loss=selection_loss,
                 classification_loss=selection_cls_loss,
                 metric_loss=selection_metric_loss,
+                clip_loss=selection_clip_loss,
+                resnet_loss=selection_resnet_loss,
                 kmeans_score=selection_kmeans,
                 mined_triplets=selection_triplets,
                 learning_rate=current_lr,
@@ -940,39 +1242,58 @@ class Exp_Stage1_Feature(Exp_Basic):
             tqdm.write(
                 f"Epoch: {epoch + 1}, Steps: {train_steps}, | "
                 f"Train Step Loss: {train_step_loss:.5f}, "
-                f"Cls: {train_step_cls_loss:.5f}, Metric: {train_step_metric_loss:.5f}\n"
+                f"Cls: {train_step_cls_loss:.5f}, Metric: {train_step_metric_loss:.5f}, "
+                f"CLIP: {train_step_clip_loss:.5f}, ResNet: {train_step_resnet_loss:.5f}\n"
                 f"Train feature results --- Loss: {train_eval_loss:.5f}, Cls: {train_eval_cls_loss:.5f}, "
-                f"Metric: {train_eval_metric_loss:.5f}, KMeans: {train_kmeans:.5f}, "
+                f"Metric: {train_eval_metric_loss:.5f}, CLIP: {train_eval_clip_loss:.5f}, ResNet: {train_eval_resnet_loss:.5f}, "
+                f"KMeans: {train_kmeans:.5f}, "
                 f"MinedTriplets(step/eval): {train_step_triplets}/{train_eval_triplets}\n"
                 f"{selection_name} feature results --- Loss: {selection_loss:.5f}, "
                 f"Cls: {selection_cls_loss:.5f}, Metric: {selection_metric_loss:.5f}, "
+                f"CLIP: {selection_clip_loss:.5f}, ResNet: {selection_resnet_loss:.5f}, "
                 f"KMeans: {selection_kmeans:.5f}, MinedTriplets: {selection_triplets}"
             )
+            weighted_image_loss = (
+                float(getattr(self.args, "stage1_clip_weight", 0.0)) * selection_clip_loss
+                + float(getattr(self.args, "stage1_resnet_weight", 0.0)) * selection_resnet_loss
+            )
+            selection_values = {
+                "loss": selection_loss,
+                "kmeans_score": selection_kmeans,
+                "image_loss": weighted_image_loss,
+            }
+            selection_value = selection_values[selection_metric_name]
             epoch_iterator.set_postfix(
                 train_loss=f"{train_eval_loss:.4f}",
-                selection_kmeans=f"{selection_kmeans:.4f}",
+                selection=f"{selection_value:.4f}",
                 refresh=False,
             )
+            if maximize_selection_metric:
+                improved = selection_value > best_selection_metric + 1e-6
+            else:
+                improved = selection_value < best_selection_metric - 1e-6
 
-            if selection_kmeans > best_selection_kmeans + 1e-6:
-                best_selection_kmeans = selection_kmeans
+            if improved:
+                best_selection_metric = selection_value
                 early_stop_counter = 0
                 stage1_model = unwrap_model(self.model)
                 checkpoint_payload = build_checkpoint_payload(
                     self.model,
                     optimizer=model_optim,
                     epoch=epoch,
-                    best_metric=best_selection_kmeans,
+                    best_metric=best_selection_metric,
                     args_dict=vars(deepcopy(self.args)),
                     extra={
                         "stage": "stage1_feature_training",
                         "selection_split": selection_split,
+                        "selection_metric": selection_metric_name,
+                        "selection_metric_value": float(best_selection_metric),
                         "backbone_state_dict": stage1_model.backbone.state_dict(),
                     },
                 )
                 torch.save(checkpoint_payload, checkpoint_dir / "checkpoint.pth")
                 tqdm.write(
-                    f"{selection_name} KMeans improved to {best_selection_kmeans:.5f}. "
+                    f"{selection_name} {selection_metric_name} improved to {best_selection_metric:.5f}. "
                     "Saving best feature checkpoint ..."
                 )
             else:
@@ -993,6 +1314,14 @@ class Exp_Stage1_Feature(Exp_Basic):
 
     def test(self, setting, test=0):
         test_data, _ = self._get_data(flag="TEST")
+        test_data = self._with_image_targets(test_data)
+        if self.use_validation:
+            vali_data, _ = self._get_data(flag="VAL")
+            vali_data = self._with_image_targets(vali_data)
+            vali_loader = self._build_eval_loader(vali_data)
+        else:
+            vali_loader = None
+        self._release_image_teachers()
         test_loader = self._build_eval_loader(test_data)
         checkpoint_dir = self._checkpoint_dir(setting)
 
@@ -1005,17 +1334,19 @@ class Exp_Stage1_Feature(Exp_Basic):
             test_loss,
             test_cls_loss,
             test_metric_loss,
+            test_clip_loss,
+            test_resnet_loss,
             test_kmeans,
             test_triplets,
         ) = self._evaluate_loader(test_loader)
 
         if self.use_validation:
-            vali_data, _ = self._get_data(flag="VAL")
-            vali_loader = self._build_eval_loader(vali_data)
             (
                 val_loss,
                 val_cls_loss,
                 val_metric_loss,
+                val_clip_loss,
+                val_resnet_loss,
                 val_kmeans,
                 val_triplets,
             ) = self._evaluate_loader(vali_loader)
@@ -1025,11 +1356,13 @@ class Exp_Stage1_Feature(Exp_Basic):
                 loss=val_loss,
                 classification_loss=val_cls_loss,
                 metric_loss=val_metric_loss,
+                clip_loss=val_clip_loss,
+                resnet_loss=val_resnet_loss,
                 kmeans_score=val_kmeans,
                 mined_triplets=val_triplets,
             )
         else:
-            val_loss = val_cls_loss = val_metric_loss = val_kmeans = val_triplets = None
+            val_loss = val_cls_loss = val_metric_loss = val_clip_loss = val_resnet_loss = val_kmeans = val_triplets = None
 
         self._append_metric_row(
             epoch="final",
@@ -1037,6 +1370,8 @@ class Exp_Stage1_Feature(Exp_Basic):
             loss=test_loss,
             classification_loss=test_cls_loss,
             metric_loss=test_metric_loss,
+            clip_loss=test_clip_loss,
+            resnet_loss=test_resnet_loss,
             kmeans_score=test_kmeans,
             mined_triplets=test_triplets,
         )
@@ -1044,14 +1379,14 @@ class Exp_Stage1_Feature(Exp_Basic):
         if self.use_validation:
             print(
                 f"Final validation feature results --- Loss: {val_loss:.5f}, Cls: {val_cls_loss:.5f}, "
-                f"Metric: {val_metric_loss:.5f}, KMeans: {val_kmeans:.5f}, MinedTriplets: {val_triplets}\n"
+                f"Metric: {val_metric_loss:.5f}, CLIP: {val_clip_loss:.5f}, ResNet: {val_resnet_loss:.5f}, KMeans: {val_kmeans:.5f}, MinedTriplets: {val_triplets}\n"
                 f"Final test feature results --- Loss: {test_loss:.5f}, Cls: {test_cls_loss:.5f}, "
-                f"Metric: {test_metric_loss:.5f}, KMeans: {test_kmeans:.5f}, MinedTriplets: {test_triplets}"
+                f"Metric: {test_metric_loss:.5f}, CLIP: {test_clip_loss:.5f}, ResNet: {test_resnet_loss:.5f}, KMeans: {test_kmeans:.5f}, MinedTriplets: {test_triplets}"
             )
         else:
             print(
                 f"Final test feature results (validation disabled) --- Loss: {test_loss:.5f}, "
-                f"Cls: {test_cls_loss:.5f}, Metric: {test_metric_loss:.5f}, "
+                f"Cls: {test_cls_loss:.5f}, Metric: {test_metric_loss:.5f}, CLIP: {test_clip_loss:.5f}, ResNet: {test_resnet_loss:.5f}, "
                 f"KMeans: {test_kmeans:.5f}, MinedTriplets: {test_triplets}"
             )
 
