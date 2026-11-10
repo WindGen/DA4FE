@@ -9,6 +9,7 @@ import torch
 import torch.nn.functional as F
 from pathlib import Path
 from torch.utils.data import Dataset, DataLoader
+from scipy.signal import butter, sosfiltfilt
 from data_provider.uea import (normalize_batch_ts,bandpass_filter_func)
 import warnings
 import random
@@ -30,6 +31,45 @@ except ImportError:  # pragma: no cover - optional runtime dependency
     load_dataset = None
 
 warnings.filterwarnings("ignore")
+
+
+def _build_eeg_filter_sos(args):
+    enabled = getattr(args, "eeg_filter_enabled", False)
+    if isinstance(enabled, str):
+        enabled = enabled.strip().lower() in {"true", "1", "yes", "y", "on"}
+    if not enabled:
+        return None
+
+    raw_sampling_rate = getattr(args, "sampling_rate", None)
+    sampling_rate = float(raw_sampling_rate if raw_sampling_rate is not None else 1000.0)
+    low_hz = float(getattr(args, "eeg_filter_low_hz", 0.0))
+    high_hz = float(getattr(args, "eeg_filter_high_hz", 45.0))
+    if not np.isfinite(sampling_rate) or sampling_rate <= 0:
+        raise ValueError(f"EEG filtering requires a positive sampling_rate, got {sampling_rate}")
+    if not np.isfinite(low_hz) or not np.isfinite(high_hz):
+        raise ValueError("EEG filter cutoff frequencies must be finite numbers")
+    if low_hz < 0 or high_hz <= low_hz or high_hz >= sampling_rate / 2.0:
+        raise ValueError(
+            "EEG filter cutoffs must satisfy 0 <= eeg_filter_low_hz < "
+            "eeg_filter_high_hz < sampling_rate / 2; "
+            f"got low={low_hz}, high={high_hz}, sampling_rate={sampling_rate}"
+        )
+    if low_hz == 0:
+        return butter(4, high_hz, btype="lowpass", fs=sampling_rate, output="sos")
+    return butter(4, [low_hz, high_hz], btype="bandpass", fs=sampling_rate, output="sos")
+
+
+def _apply_eeg_filter(sample, filter_sos):
+    if filter_sos is None:
+        return sample
+    try:
+        filtered = sosfiltfilt(filter_sos, sample, axis=0)
+    except ValueError as exc:
+        raise ValueError(
+            f"Cannot filter EEG sample with shape {sample.shape}; "
+            "the time dimension may be too short for zero-phase filtering"
+        ) from exc
+    return filtered.astype(np.float32, copy=False)
 
 class APAVALoader(Dataset):
     def __init__(self, args, root_path, flag=None):
@@ -661,6 +701,7 @@ class EEGImageNetHuggingFaceLoader(Dataset):
         self.args = args
         self.root_path = root_path
         self.flag = str(flag).upper() if flag else "TRAIN"
+        self.eeg_filter_sos = _build_eeg_filter_sos(args)
         self.split_mode = str(
             getattr(args, "eeg_hf_split_mode", "original")
         ).strip().lower()
@@ -1272,6 +1313,7 @@ class EEGImageNetHuggingFaceLoader(Dataset):
         if eeg.shape[0] < eeg.shape[1]:
             eeg = eeg.T
 
+        eeg = _apply_eeg_filter(eeg, self.eeg_filter_sos)
         eeg = self._resample_sample(eeg)
         if self.normalize:
             eeg = self._normalize_sample(eeg)
@@ -1290,6 +1332,7 @@ class EEGImageNetLoader(Dataset):
         self.root_path = Path(root_path)
         self.data_root = self._resolve_data_root(self.root_path)
         self.flag = flag
+        self.eeg_filter_sos = _build_eeg_filter_sos(args)
         self.normalize = getattr(args, "eeg_normalize", True)
         self.max_classes = getattr(args, "eeg_num_classes", 0)
         self.target_seq_len = getattr(args, "requested_seq_len", getattr(args, "seq_len", None))
@@ -1487,6 +1530,7 @@ class EEGImageNetLoader(Dataset):
         if eeg.shape[0] < eeg.shape[1]:
             eeg = eeg.T
 
+        eeg = _apply_eeg_filter(eeg, self.eeg_filter_sos)
         eeg = self._resample_sample(eeg)
         if self.normalize:
             eeg = self._normalize_sample(eeg)

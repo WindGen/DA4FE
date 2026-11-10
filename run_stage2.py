@@ -48,6 +48,9 @@ STAGE1_PARAM_KEYS = (
     "dropout",
     "augmentations",
     "eeg_normalize",
+    "eeg_filter_enabled",
+    "eeg_filter_low_hz",
+    "eeg_filter_high_hz",
     "eeg_num_classes",
     "eeg_adaptive_seq_len",
     "stage1_l2_normalize",
@@ -107,7 +110,9 @@ def build_stage2_full_setting(args):
     setting = (
         f"{args.model}_{args.data}_seed_{args.seed}_stage2_heads_{args.stage2_classifier_heads}"
         f"_std_{int(args.stage2_standardize_features)}"
-        f"_l2norm_{int(args.stage1_l2_normalize)}_bs_{args.batch_size}"
+        f"_l2norm_{int(args.stage1_l2_normalize)}"
+        f"_eegfilter_{int(args.eeg_filter_enabled)}_{args.eeg_filter_low_hz}_{args.eeg_filter_high_hz}"
+        f"_bs_{args.batch_size}"
     )
     if args.model == "DA4FE":
         setting += (
@@ -215,6 +220,9 @@ if __name__ == "__main__":
 
     parser.add_argument("--augmentations", type=str, default="none")
     parser.add_argument("--eeg_normalize", type=str2bool, default=False)
+    parser.add_argument("--eeg_filter_enabled", "--eeg-filter-enabled", type=str2bool, default=None, help="override Stage-1 EEG filter setting; defaults to the Stage-1 run_params.json value")
+    parser.add_argument("--eeg_filter_low_hz", "--eeg-filter-low-hz", type=float, default=None, help="override EEG filter low cutoff in Hz; 0 selects low-pass")
+    parser.add_argument("--eeg_filter_high_hz", "--eeg-filter-high-hz", type=float, default=None, help="override EEG filter high cutoff in Hz")
     parser.add_argument("--eeg_num_classes", type=int, default=0)
     parser.add_argument("--eeg_adaptive_seq_len", type=str2bool, default=True)
 
@@ -259,8 +267,22 @@ if __name__ == "__main__":
     parser.add_argument("--devices", type=str, default="0,1,2,3")
 
     args = parser.parse_args()
+    filter_overrides = {
+        "eeg_filter_enabled": args.eeg_filter_enabled,
+        "eeg_filter_low_hz": args.eeg_filter_low_hz,
+        "eeg_filter_high_hz": args.eeg_filter_high_hz,
+    }
     if args.run_params is not None:
         args = apply_stage1_run_params(args, args.run_params)
+    for name, value in filter_overrides.items():
+        if value is not None:
+            setattr(args, name, value)
+    if args.eeg_filter_enabled is None:
+        args.eeg_filter_enabled = False
+    if args.eeg_filter_low_hz is None:
+        args.eeg_filter_low_hz = 0.0
+    if args.eeg_filter_high_hz is None:
+        args.eeg_filter_high_hz = 45.0
     effective_f_layer = (
         args.f_layer if args.f_layer is not None else args.t_layer
     )

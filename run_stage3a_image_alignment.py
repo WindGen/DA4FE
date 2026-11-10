@@ -44,6 +44,9 @@ parser.add_argument("--eeg_hf_split_seed", type=int, default=None, help="overrid
 parser.add_argument("--eeg_hf_train_ratio", type=float, default=None, help="override the self-split train ratio")  # 训练集比例
 parser.add_argument("--eeg_hf_val_ratio", type=float, default=None, help="override the self-split validation ratio")  # 验证集比例
 parser.add_argument("--eeg_hf_test_ratio", type=float, default=None, help="override the self-split test ratio")  # 测试集比例
+parser.add_argument("--eeg_filter_enabled", "--eeg-filter-enabled", type=str2bool, default=None, help="override the EEG filter setting saved in Stage-1 parameters")  # 是否滤波
+parser.add_argument("--eeg_filter_low_hz", "--eeg-filter-low-hz", type=float, default=None, help="override EEG filter low cutoff in Hz; 0 selects low-pass")  # 滤波低截止频率
+parser.add_argument("--eeg_filter_high_hz", "--eeg-filter-high-hz", type=float, default=None, help="override EEG filter high cutoff in Hz")  # 滤波高截止频率
 
 # Frozen CLIP image teacher.
 parser.add_argument("--pretrained_root", type=str, default="../pretrained", help="root directory containing local pretrained models")  # 预训练权重目录

@@ -44,6 +44,9 @@ parser.add_argument("--eeg_hf_split_seed", type=int, default=None, help="random 
 parser.add_argument("--eeg_hf_train_ratio", type=float, default=None, help="train ratio for HF self split")  # HF训练比例
 parser.add_argument("--eeg_hf_val_ratio", type=float, default=None, help="validation ratio for HF self split")  # HF验证比例
 parser.add_argument("--eeg_hf_test_ratio", type=float, default=None, help="test ratio for HF self split")  # HF测试比例
+parser.add_argument("--eeg_filter_enabled", "--eeg-filter-enabled", type=str2bool, default=None, help="override the EEG filter setting saved in Stage-1 parameters")  # 是否滤波
+parser.add_argument("--eeg_filter_low_hz", "--eeg-filter-low-hz", type=float, default=None, help="override EEG filter low cutoff in Hz; 0 selects low-pass")  # 滤波低截止频率
+parser.add_argument("--eeg_filter_high_hz", "--eeg-filter-high-hz", type=float, default=None, help="override EEG filter high cutoff in Hz")  # 滤波高截止频率
 
 # Local pretrained models; no large model is downloaded automatically.
 parser.add_argument("--pretrained_root", type=str, default="../pretrained", help="directory containing stable-diffusion-v1-5 and clip-vit-large-patch14")  # 预训练权重根目录

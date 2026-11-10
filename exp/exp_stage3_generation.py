@@ -102,7 +102,7 @@ class Exp_Stage3_Generation:
 
     def _apply_stage1_overrides(self):
         """Use CLI values when supplied, otherwise retain DA4FE run parameters."""
-        for name in ("eeg_hf_dataset_id", "eeg_hf_cache_dir", "eeg_hf_split_mode", "eeg_hf_split_seed", "eeg_hf_train_ratio", "eeg_hf_val_ratio", "eeg_hf_test_ratio"):
+        for name in ("eeg_hf_dataset_id", "eeg_hf_cache_dir", "eeg_hf_split_mode", "eeg_hf_split_seed", "eeg_hf_train_ratio", "eeg_hf_val_ratio", "eeg_hf_test_ratio", "eeg_filter_enabled", "eeg_filter_low_hz", "eeg_filter_high_hz"):
             value = getattr(self.args, name, None)
             if value is not None:
                 setattr(self.stage1_args, name, value)
@@ -111,6 +111,12 @@ class Exp_Stage3_Generation:
         self.stage1_args.eeg_adaptive_seq_len = getattr(self.stage1_args, "eeg_adaptive_seq_len", True)
         self.stage1_args.eeg_normalize = getattr(self.stage1_args, "eeg_normalize", True)
         self.stage1_args.seed = int(getattr(self.stage1_args, "seed", self.args.seed))
+        for name, default in (("eeg_filter_enabled", False), ("eeg_filter_low_hz", 0.0), ("eeg_filter_high_hz", 45.0)):
+            value = getattr(self.stage1_args, name, default)
+            if value is None:
+                value = default
+            setattr(self.stage1_args, name, value)
+            setattr(self.args, name, value)
 
     def _dataset_args(self):
         dataset_args = SimpleNamespace(**vars(self.stage1_args))

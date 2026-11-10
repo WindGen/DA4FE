@@ -88,6 +88,7 @@ def build_full_setting(args):
         setting += f"_tw_{args.triplet_weight}"
 
     setting += f"_eegnorm_{int(args.eeg_normalize)}"
+    setting += f"_eegfilter_{int(args.eeg_filter_enabled)}_{args.eeg_filter_low_hz}_{args.eeg_filter_high_hz}"
     setting += f"_eegcls_{args.eeg_num_classes}"
     effective_eeg_adaptive = args.eeg_adaptive_seq_len and args.requested_seq_len > 0
     setting += f"_eegadapt_{int(effective_eeg_adaptive)}"
@@ -235,6 +236,9 @@ if __name__ == "__main__":
         default=False,
         help="whether to normalize each EEG-ImageNet sample channel-wise over time",
     )
+    parser.add_argument("--eeg_filter_enabled", "--eeg-filter-enabled", type=str2bool, default=False, help="apply zero-phase EEG filtering before resampling and normalization")
+    parser.add_argument("--eeg_filter_low_hz", "--eeg-filter-low-hz", type=float, default=0.0, help="EEG filter low cutoff in Hz; 0 selects a low-pass filter")
+    parser.add_argument("--eeg_filter_high_hz", "--eeg-filter-high-hz", type=float, default=45.0, help="EEG filter high cutoff in Hz")
     parser.add_argument(
         "--eeg_num_classes",
         type=int,

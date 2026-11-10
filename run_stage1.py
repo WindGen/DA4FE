@@ -45,7 +45,9 @@ def build_stage1_full_setting(args):
         f"_ls_{args.stage1_label_smoothing}"
         f"_afs_{args.stage1_arcface_s}_afm_{args.stage1_arcface_m}"
         f"_cfs_{args.stage1_cosface_s}_cfm_{args.stage1_cosface_m}"
-        f"_eegnorm_{int(args.eeg_normalize)}_eegcls_{args.eeg_num_classes}"
+        f"_eegnorm_{int(args.eeg_normalize)}"
+        f"_eegfilter_{int(args.eeg_filter_enabled)}_{args.eeg_filter_low_hz}_{args.eeg_filter_high_hz}"
+        f"_eegcls_{args.eeg_num_classes}"
         f"_hfsplit_{getattr(args, 'eeg_hf_split_mode', 'original')}"
         f"_hfseed_{getattr(args, 'eeg_hf_split_seed', args.seed)}"
         f"_hfratio_{getattr(args, 'eeg_hf_train_ratio', 0.6)}"
@@ -145,6 +147,9 @@ if __name__ == "__main__":
     # EEG preprocessing and augmentation.
     parser.add_argument("--augmentations", type=str, default="flip0.1,frequency0.05,jitter0.05,mask0.05,channel0.1,drop0.05")
     parser.add_argument("--eeg_normalize", type=str2bool, default=True)
+    parser.add_argument("--eeg_filter_enabled", "--eeg-filter-enabled", type=str2bool, default=False, help="apply zero-phase EEG filtering before resampling and normalization")
+    parser.add_argument("--eeg_filter_low_hz", "--eeg-filter-low-hz", type=float, default=0.0, help="EEG filter low cutoff in Hz; 0 selects a low-pass filter")
+    parser.add_argument("--eeg_filter_high_hz", "--eeg-filter-high-hz", type=float, default=45.0, help="EEG filter high cutoff in Hz")
     parser.add_argument("--eeg_num_classes", type=int, default=0)
     parser.add_argument("--eeg_adaptive_seq_len", type=str2bool, default=True)
 
