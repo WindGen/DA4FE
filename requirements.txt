@@ -11,6 +11,7 @@ torch==2.4.1
 tqdm==4.66.5
 pytorch-metric-learning>=2.3.0
 diffusers==0.30.3
+peft==0.13.2
 transformers==4.44.2
 accelerate==0.34.2
 safetensors>=0.4.0

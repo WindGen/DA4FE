@@ -67,6 +67,11 @@ DEFAULTS = {
     "generation_weight_decay": 1e-2,
     "generation_clip_weight": 0.0,
     "generation_stage1_lr": 0.0,
+    "generation_unet_tuning": None,
+    "generation_lora_rank": 8,
+    "generation_lora_alpha": 8,
+    "generation_lora_dropout": 0.0,
+    "generation_lora_lr": 1e-5,
     "generation_train_unet": False,
     "generation_grad_clip": 1.0,
     "generation_num_inference_steps": 50,
@@ -252,6 +257,17 @@ def main():
 
     run_params_path = Path(cli.run_params).expanduser() if cli.run_params else checkpoint_path.parent / "run_params.json"
     values = load_run_args(run_params_path)
+    checkpoint_tuning = checkpoint.get("generation_unet_tuning")
+    if checkpoint_tuning is not None:
+        if values.get("generation_unet_tuning") is None:
+            values["generation_unet_tuning"] = checkpoint_tuning
+        elif values["generation_unet_tuning"] != checkpoint_tuning:
+            raise ValueError("The saved run_params.json and checkpoint disagree on generation_unet_tuning")
+    checkpoint_lora_config = checkpoint.get("generation_lora_config")
+    if checkpoint_lora_config:
+        values["generation_lora_rank"] = checkpoint_lora_config["rank"]
+        values["generation_lora_alpha"] = checkpoint_lora_config["alpha"]
+        values["generation_lora_dropout"] = checkpoint_lora_config["dropout"]
     values["output_dir"] = str(Path(cli.output_dir).expanduser() if cli.output_dir else checkpoint_path.parent / "top100_selection")
     values["generation_clip_weight"] = 0.0
     values["generation_stage1_lr"] = 0.0

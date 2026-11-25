@@ -37,10 +37,11 @@ def _first_existing(paths):
 
 
 class Exp_Stage3_Generation:
-    """Train an EEG condition adapter and optionally SD cross-attention layers."""
+    """Train an EEG adapter with selectable Stable-Diffusion U-Net tuning."""
 
     def __init__(self, args):
         self.args = args
+        self._resolve_unet_tuning()
         self.device = torch.device("cuda" if args.use_gpu and torch.cuda.is_available() else "cpu")
         print(f"Using device: {self.device}")
         self.stage1_args, self.stage1_checkpoint_path = self._load_stage1_metadata()
@@ -53,6 +54,28 @@ class Exp_Stage3_Generation:
         self._build_diffusion_models()
         self.output_dir = Path(args.output_dir).expanduser().resolve()
         self.output_dir.mkdir(parents=True, exist_ok=True)
+
+    def _resolve_unet_tuning(self):
+        """Resolve the new tuning mode while preserving old run configurations."""
+        tuning = getattr(self.args, "generation_unet_tuning", None)
+        if tuning is None:
+            tuning = "cross_attention" if bool(getattr(self.args, "generation_train_unet", True)) else "none"
+        valid_modes = {"none", "lora", "cross_attention", "full"}
+        if tuning not in valid_modes:
+            raise ValueError(f"generation_unet_tuning must be one of {sorted(valid_modes)}, got {tuning!r}")
+        if tuning == "lora":
+            if int(getattr(self.args, "generation_lora_rank", 8)) <= 0:
+                raise ValueError("generation_lora_rank must be positive")
+            if int(getattr(self.args, "generation_lora_alpha", 8)) <= 0:
+                raise ValueError("generation_lora_alpha must be positive")
+            lora_dropout = float(getattr(self.args, "generation_lora_dropout", 0.0))
+            if not 0.0 <= lora_dropout < 1.0:
+                raise ValueError("generation_lora_dropout must be in [0, 1)")
+            if float(getattr(self.args, "generation_lora_lr", 1e-5)) <= 0:
+                raise ValueError("generation_lora_lr must be positive")
+        self.args.generation_unet_tuning = tuning
+        # Keep this alias for older helper scripts that still inspect the bool.
+        self.args.generation_train_unet = tuning != "none"
 
     def _load_stage1_metadata(self):
         stage3a_path = getattr(self.args, "stage3a_checkpoint", None)
@@ -209,11 +232,45 @@ class Exp_Stage3_Generation:
             condition_input_dim = int(projection_config["output_dim"])
         self.condition_adapter = EEGConditionAdapter(condition_input_dim, context_dim=int(cross_dim), num_tokens=self.args.generation_context_tokens, hidden_dim=self.args.generation_adapter_hidden_dim, dropout=self.args.generation_adapter_dropout).to(self.device)
         self.trainable_unet_parameters = []
-        if self.args.generation_train_unet:
+        self.generation_lora_config = None
+        if self.args.generation_unet_tuning == "lora":
+            try:
+                from peft import LoraConfig
+            except ImportError as exc:
+                raise ImportError("U-Net LoRA requires peft==0.13.2; install the updated requirements.txt") from exc
+            target_modules = r".*attn2\.(to_q|to_k|to_v|to_out\.0)"
+            lora_config = LoraConfig(
+                r=int(self.args.generation_lora_rank),
+                lora_alpha=int(self.args.generation_lora_alpha),
+                lora_dropout=float(self.args.generation_lora_dropout),
+                target_modules=target_modules,
+                bias="none",
+                init_lora_weights="gaussian",
+            )
+            if not hasattr(self.unet, "add_adapter"):
+                raise RuntimeError("The installed diffusers version does not support adding PEFT adapters to U-Net")
+            self.unet.add_adapter(lora_config)
+            # The base U-Net was frozen above; explicitly keep only injected LoRA weights trainable.
+            for name, parameter in self.unet.named_parameters():
+                parameter.requires_grad = "lora_" in name.lower()
+            self.generation_lora_config = {
+                "rank": int(self.args.generation_lora_rank),
+                "alpha": int(self.args.generation_lora_alpha),
+                "dropout": float(self.args.generation_lora_dropout),
+                "target_modules": target_modules,
+            }
+            self.trainable_unet_parameters = [parameter for parameter in self.unet.parameters() if parameter.requires_grad]
+            if not self.trainable_unet_parameters:
+                raise RuntimeError("No U-Net LoRA parameters were injected; check the target_modules pattern")
+        elif self.args.generation_unet_tuning == "cross_attention":
             for name, parameter in self.unet.named_parameters():
                 if "attn2" in name or "cross" in name:
                     parameter.requires_grad = True
                     self.trainable_unet_parameters.append(parameter)
+        elif self.args.generation_unet_tuning == "full":
+            for parameter in self.unet.parameters():
+                parameter.requires_grad = True
+            self.trainable_unet_parameters = [parameter for parameter in self.unet.parameters() if parameter.requires_grad]
         self.clip_model = None
         if self.args.generation_clip_weight > 0:
             try:
@@ -224,13 +281,19 @@ class Exp_Stage3_Generation:
             self.clip_model = CLIPVisionModelWithProjection.from_pretrained(str(clip_path), cache_dir=self.args.hf_cache_dir, local_files_only=not self.args.allow_hf_download).to(self.device).eval()
             for parameter in self.clip_model.parameters():
                 parameter.requires_grad = False
-        params = [{"params": list(self.condition_adapter.parameters()) + self.trainable_unet_parameters, "lr": self.args.generation_lr}]
+        params = [{"params": list(self.condition_adapter.parameters()), "lr": self.args.generation_lr}]
+        if self.trainable_unet_parameters:
+            unet_lr = self.args.generation_lora_lr if self.args.generation_unet_tuning == "lora" else self.args.generation_lr
+            params.append({"params": self.trainable_unet_parameters, "lr": unet_lr})
         if self.args.generation_stage1_lr > 0:
             feature_params = [parameter for parameter in self.stage1_model.parameters() if parameter.requires_grad]
             if self.eeg_image_projection is not None:
                 feature_params.extend(parameter for parameter in self.eeg_image_projection.parameters() if parameter.requires_grad)
             params.append({"params": feature_params, "lr": self.args.generation_stage1_lr})
         self.optimizer = torch.optim.AdamW(params, lr=self.args.generation_lr, weight_decay=self.args.generation_weight_decay)
+        self.trainable_parameters = [parameter for group in params for parameter in group["params"]]
+        unet_trainable_count = sum(parameter.numel() for parameter in self.trainable_unet_parameters)
+        print(f"U-Net tuning: {self.args.generation_unet_tuning}; trainable U-Net parameters: {unet_trainable_count:,}")
 
     def _loader(self, dataset, train=False):
         return DataLoader(dataset, batch_size=self.args.generation_batch_size, shuffle=train, num_workers=self.args.num_workers, drop_last=False, collate_fn=lambda batch: generation_collate(batch, max_len=self.stage1_args.seq_len))
@@ -300,7 +363,7 @@ class Exp_Stage3_Generation:
         unet_state = {name: value.detach().cpu() for name, value in self.unet.state_dict().items() if name in trainable_names}
         stage1_state = self.stage1_model.state_dict() if self.args.generation_stage1_lr > 0 else None
         projection_state = self.eeg_image_projection.state_dict() if self.eeg_image_projection is not None else None
-        torch.save({"epoch": epoch, "metrics": metrics, "condition_adapter": self.condition_adapter.state_dict(), "unet_trainable": unet_state, "stage1_model": stage1_state, "eeg_image_projection": projection_state, "optimizer": self.optimizer.state_dict(), "stage1_checkpoint": str(self.stage1_checkpoint_path)}, path)
+        torch.save({"epoch": epoch, "metrics": metrics, "condition_adapter": self.condition_adapter.state_dict(), "unet_trainable": unet_state, "generation_unet_tuning": self.args.generation_unet_tuning, "generation_lora_config": self.generation_lora_config, "stage1_model": stage1_state, "eeg_image_projection": projection_state, "optimizer": self.optimizer.state_dict(), "stage1_checkpoint": str(self.stage1_checkpoint_path)}, path)
         return path
 
     def _load_best_checkpoint(self):
@@ -308,6 +371,9 @@ class Exp_Stage3_Generation:
         if not path.is_file():
             return
         checkpoint = load_checkpoint_object(path, map_location=self.device)
+        saved_tuning = checkpoint.get("generation_unet_tuning")
+        if saved_tuning is not None and saved_tuning != self.args.generation_unet_tuning:
+            raise ValueError(f"Checkpoint uses U-Net tuning mode {saved_tuning!r}, but this run is configured for {self.args.generation_unet_tuning!r}")
         self.condition_adapter.load_state_dict(checkpoint["condition_adapter"])
         if checkpoint.get("unet_trainable"):
             self.unet.load_state_dict(checkpoint["unet_trainable"], strict=False)
@@ -334,7 +400,7 @@ class Exp_Stage3_Generation:
         for epoch in epoch_progress:
             self.stage1_model.train(self.args.generation_stage1_lr > 0)
             self.condition_adapter.train()
-            self.unet.train(self.args.generation_train_unet)
+            self.unet.train(self.args.generation_unet_tuning != "none")
             totals = np.zeros(3, dtype=np.float64)
             count = 0
             start = time.time()
@@ -343,7 +409,7 @@ class Exp_Stage3_Generation:
                 self.optimizer.zero_grad(set_to_none=True)
                 value, diffusion_value, clip_value = self._loss_for_batch(batch)
                 value.backward()
-                torch.nn.utils.clip_grad_norm_(self.condition_adapter.parameters(), self.args.generation_grad_clip)
+                torch.nn.utils.clip_grad_norm_(self.trainable_parameters, self.args.generation_grad_clip)
                 self.optimizer.step()
                 size = batch["eeg"].shape[0]
                 totals += np.asarray([float(value), float(diffusion_value), float(clip_value)]) * size

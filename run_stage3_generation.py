@@ -69,7 +69,12 @@ parser.add_argument("--generation_lr", type=float, default=1e-4, help="learning 
 parser.add_argument("--generation_weight_decay", type=float, default=1e-2, help="AdamW weight decay")  # 权重衰减
 parser.add_argument("--generation_clip_weight", type=float, default=0.2, help="weight of optional CLIP image alignment loss; zero disables CLIP loading")  # CLIP损失权重
 parser.add_argument("--generation_stage1_lr", type=float, default=0.0, help="learning rate for DA4FE; zero freezes the Stage-1 feature extractor")  # DA4FE微调学习率
-parser.add_argument("--generation_train_unet", type=str2bool, default=True, help="train Stable Diffusion cross-attention parameters in addition to the EEG adapter")  # 是否训练U-Net交叉注意力
+parser.add_argument("--generation_unet_tuning", choices=["none", "lora", "cross_attention", "full"], default=None, help="U-Net tuning strategy: none, LoRA, full cross-attention weights, or the entire U-Net")  # U-Net微调策略
+parser.add_argument("--generation_lora_rank", type=int, default=8, help="LoRA rank used when generation_unet_tuning=lora")  # LoRA秩
+parser.add_argument("--generation_lora_alpha", type=int, default=8, help="LoRA alpha used when generation_unet_tuning=lora")  # LoRA缩放系数
+parser.add_argument("--generation_lora_dropout", type=float, default=0.0, help="LoRA dropout used when generation_unet_tuning=lora")  # LoRA dropout
+parser.add_argument("--generation_lora_lr", type=float, default=1e-5, help="learning rate for U-Net LoRA parameters")  # LoRA学习率
+parser.add_argument("--generation_train_unet", type=str2bool, default=True, help="legacy switch; used only when generation_unet_tuning is omitted")  # 旧版U-Net开关
 parser.add_argument("--generation_grad_clip", type=float, default=1.0, help="gradient clipping norm")  # 梯度裁剪
 
 # Evaluation and output parameters.
